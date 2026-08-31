@@ -11,8 +11,11 @@ from .memory import (
     recent_messages,
     get_profile,
     set_display_name,
+    set_preferred_language,
     add_memory,
     saved_memories,
+    upsert_smart_memory,
+    get_smart_memories,
 )
 
 @asynccontextmanager
@@ -20,7 +23,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     yield
 
-app = FastAPI(title="Lio API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Lio API", version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,14 +42,9 @@ class ChatResponse(BaseModel):
     mode: str
 
 def _clean_value(value: str) -> str:
-    return value.strip().strip('"\'“”‘’ ').rstrip(".،,!?؟")[:120]
+    return value.strip().strip('"\'“”‘’ ').rstrip(".،,!?؟")[:240]
 
-def _extract_name(message: str):
-    patterns = [
-        r"(?:^|\s)(?:أنا\s+)?اسمي\s+([^\n،,.!?؟]{1,80})",
-        r"\bmy\s+name\s+is\s+([^\n,.!?]{1,80})",
-        r"\b(?:ich\s+hei(?:ß|ss)e|mein\s+name\s+ist)\s+([^\n,.!?]{1,80})",
-    ]
+def _first_match(message: str, patterns):
     for pattern in patterns:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -54,6 +52,16 @@ def _extract_name(message: str):
             if value:
                 return value
     return None
+
+def _extract_name(message: str):
+    return _first_match(
+        message,
+        [
+            r"(?:^|\s)(?:أنا\s+)?اسمي\s+([^\n،,.!?؟]{1,80})",
+            r"\bmy\s+name\s+is\s+([^\n,.!?]{1,80})",
+            r"\b(?:ich\s+hei(?:ß|ss)e|mein\s+name\s+ist)\s+([^\n,.!?]{1,80})",
+        ],
+    )
 
 def _extract_explicit_memory(message: str):
     patterns = [
@@ -69,27 +77,100 @@ def _extract_explicit_memory(message: str):
                 return value[:1000]
     return None
 
+def _extract_structured_facts(message: str):
+    facts = []
+
+    company = _first_match(
+        message,
+        [
+            r"(?:اسم\s+)?شركتي\s+(?:هي|اسمها)?\s*([^\n،,.!?؟]{2,120})",
+            r"\bmy\s+company(?:'s\s+name)?\s+is\s+([^\n,.!?]{2,120})",
+            r"\bmeine\s+firma\s+(?:heißt|heisst|ist)\s+([^\n,.!?]{2,120})",
+        ],
+    )
+    if company:
+        facts.append(("business", "company", company, 9))
+
+    role = _first_match(
+        message,
+        [
+            r"(?:أعمل|اعمل)\s+(?:كـ?|بوظيفة)\s*([^\n،,.!?؟]{2,120})",
+            r"(?:وظيفتي|عملي)\s+(?:هي|هو)?\s*([^\n،,.!?؟]{2,120})",
+            r"\bi\s+work\s+as\s+(?:an?\s+)?([^\n,.!?]{2,120})",
+            r"\bich\s+arbeite\s+als\s+([^\n,.!?]{2,120})",
+        ],
+    )
+    if role:
+        facts.append(("work", "role", role, 7))
+
+    project = _first_match(
+        message,
+        [
+            r"(?:مشروعي|المشروع\s+الذي\s+أعمل\s+عليه)\s+(?:اسمه|هو)?\s*([^\n،,.!?؟]{2,160})",
+            r"\bmy\s+(?:current\s+)?project\s+(?:is|is\s+called)\s+([^\n,.!?]{2,160})",
+            r"\bmein\s+(?:aktuelles\s+)?projekt\s+(?:heißt|heisst|ist)\s+([^\n,.!?]{2,160})",
+        ],
+    )
+    if project:
+        facts.append(("project", "current_project", project, 8))
+
+    language = _first_match(
+        message,
+        [
+            r"(?:لغتي\s+المفضلة|أفضل\s+أن\s+تتحدث\s+معي\s+ب(?:ال)?لغة)\s+([^\n،,.!?؟]{2,80})",
+            r"\bmy\s+preferred\s+language\s+is\s+([^\n,.!?]{2,80})",
+            r"\bmeine\s+bevorzugte\s+sprache\s+ist\s+([^\n,.!?]{2,80})",
+        ],
+    )
+    if language:
+        facts.append(("preference", "preferred_language", language, 8))
+
+    return facts
+
 async def _capture_user_memory(user_id: str, message: str):
     name = _extract_name(message)
     if name:
         await set_display_name(user_id, name)
 
-    fact = _extract_explicit_memory(message)
-    if fact:
-        await add_memory(user_id, fact)
+    explicit = _extract_explicit_memory(message)
+    if explicit:
+        await add_memory(user_id, explicit)
+
+    for category, key, value, importance in _extract_structured_facts(message):
+        await upsert_smart_memory(user_id, category, key, value, importance)
+        if key == "preferred_language":
+            await set_preferred_language(user_id, value)
 
 async def _persistent_context(user_id: str) -> str:
     profile = await get_profile(user_id)
     memories = await saved_memories(user_id, 20)
+    smart = await get_smart_memories(user_id, 30)
+
     lines = []
     if profile.get("display_name"):
         lines.append(f"User display name: {profile['display_name']}")
+    if profile.get("preferred_language"):
+        lines.append(f"Preferred language: {profile['preferred_language']}")
+
+    if smart:
+        lines.append("Structured user facts:")
+        for item in smart:
+            lines.append(
+                f"- [{item['category']}] {item['key']}: {item['value']}"
+            )
+
     if memories:
-        lines.append("Saved user memories:")
+        lines.append("Explicit saved memories:")
         lines.extend(f"- {item}" for item in memories)
+
     if not lines:
         return ""
-    return "Persistent user context (saved from explicit user statements; use when relevant):\n" + "\n".join(lines)
+
+    return (
+        "Persistent user context. Treat these as saved user-provided facts and use "
+        "them only when relevant. Do not invent missing details.\n"
+        + "\n".join(lines)
+    )
 
 @app.get("/health")
 async def health():

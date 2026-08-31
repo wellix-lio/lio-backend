@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS user_profile (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS smart_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    memory_key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    importance INTEGER NOT NULL DEFAULT 5,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, category, memory_key)
+);
+
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -112,6 +124,21 @@ async def set_display_name(user_id: str, display_name: str):
         )
         await db.commit()
 
+async def set_preferred_language(user_id: str, language: str):
+    value = language.strip()
+    if not value:
+        return
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_profile(user_id, preferred_language)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET preferred_language=excluded.preferred_language
+            """,
+            (user_id, value),
+        )
+        await db.commit()
+
 async def add_memory(user_id: str, content: str):
     fact = content.strip()
     if not fact:
@@ -136,3 +163,52 @@ async def saved_memories(user_id: str, limit: int = 20):
         )
         rows = await cur.fetchall()
     return list(reversed([r[0] for r in rows]))
+
+async def upsert_smart_memory(
+    user_id: str,
+    category: str,
+    memory_key: str,
+    value: str,
+    importance: int = 5,
+):
+    value = value.strip()
+    if not value:
+        return
+    importance = max(1, min(int(importance), 10))
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO smart_memories(user_id, category, memory_key, value, importance)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, category, memory_key)
+            DO UPDATE SET
+                value=excluded.value,
+                importance=excluded.importance,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, category, memory_key, value, importance),
+        )
+        await db.commit()
+
+async def get_smart_memories(user_id: str, limit: int = 30):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT category, memory_key, value, importance
+            FROM smart_memories
+            WHERE user_id=?
+            ORDER BY importance DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        rows = await cur.fetchall()
+    return [
+        {
+            "category": r[0],
+            "key": r[1],
+            "value": r[2],
+            "importance": r[3],
+        }
+        for r in rows
+    ]
