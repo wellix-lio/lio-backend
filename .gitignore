@@ -1,0 +1,9 @@
+backend/.env
+backend/lio.db
+mobile/.env
+mobile/node_modules/
+mobile/.expo/
+*.log
+__pycache__/
+mobile/
+*.pyc

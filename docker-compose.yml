@@ -1,0 +1,12 @@
+services:
+  lio-api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - lio_data:/app/data
+
+volumes:
+  lio_data:

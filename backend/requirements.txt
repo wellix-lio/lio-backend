@@ -1,0 +1,9 @@
+fastapi>=0.116
+uvicorn[standard]>=0.35
+pydantic>=2.11
+python-dotenv>=1.1
+openai-agents>=0.4
+aiosqlite>=0.21
+
+python-multipart>=0.0.20
+openai>=1.100
