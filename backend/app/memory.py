@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS user_profile (
     user_id TEXT PRIMARY KEY,
     display_name TEXT,
-    preferred_language TEXT DEFAULT 'ar',
+    preferred_language TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -106,8 +106,8 @@ async def get_profile(user_id: str):
         )
         row = await cur.fetchone()
     if not row:
-        return {"display_name": None, "preferred_language": "ar"}
-    return {"display_name": row[0], "preferred_language": row[1] or "ar"}
+        return {"display_name": None, "preferred_language": None}
+    return {"display_name": row[0], "preferred_language": row[1]}
 
 async def set_display_name(user_id: str, display_name: str):
     name = display_name.strip()
@@ -116,8 +116,8 @@ async def set_display_name(user_id: str, display_name: str):
     async with aiosqlite.connect(LIO_DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO user_profile(user_id, display_name)
-            VALUES (?, ?)
+            INSERT INTO user_profile(user_id, display_name, preferred_language)
+            VALUES (?, ?, NULL)
             ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name
             """,
             (user_id, name),
@@ -212,3 +212,57 @@ async def get_smart_memories(user_id: str, limit: int = 30):
         }
         for r in rows
     ]
+
+async def delete_smart_memory(user_id: str, category: str, memory_key: str) -> bool:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            DELETE FROM smart_memories
+            WHERE user_id=? AND category=? AND memory_key=?
+            """,
+            (user_id, category, memory_key),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+async def clear_display_name(user_id: str) -> bool:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE user_profile
+            SET display_name=NULL
+            WHERE user_id=? AND display_name IS NOT NULL
+            """,
+            (user_id,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+async def clear_preferred_language(user_id: str) -> bool:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE user_profile
+            SET preferred_language=NULL
+            WHERE user_id=? AND preferred_language IS NOT NULL
+            """,
+            (user_id,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+async def delete_saved_memory(user_id: str, content: str) -> bool:
+    fact = content.strip()
+    if not fact:
+        return False
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            DELETE FROM memories
+            WHERE user_id=? AND content=?
+            """,
+            (user_id, fact),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+

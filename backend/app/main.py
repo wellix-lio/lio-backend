@@ -16,6 +16,10 @@ from .memory import (
     saved_memories,
     upsert_smart_memory,
     get_smart_memories,
+    delete_smart_memory,
+    clear_display_name,
+    clear_preferred_language,
+    delete_saved_memory,
 )
 
 @asynccontextmanager
@@ -23,7 +27,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     yield
 
-app = FastAPI(title="Lio API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Lio API", version="1.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,8 +110,8 @@ def _extract_structured_facts(message: str):
     project = _first_match(
         message,
         [
-            r"(?:مشروعي|المشروع\s+الذي\s+أعمل\s+عليه)\s+(?:اسمه|هو)?\s*([^\n،,.!?؟]{2,160})",
-            r"\bmy\s+(?:current\s+)?project\s+(?:is|is\s+called)\s+([^\n,.!?]{2,160})",
+            r"(?:مشروعي(?:\s+الحالي)?|المشروع\s+الذي\s+أعمل\s+عليه)\s+(?:اسمه|هو)?\s*([^\n،,.!?؟]{2,160})",
+            r"\bmy\s+(?:current\s+)?project\s+(?:is\s+called|is)\s+([^\n,.!?]{2,160})",
             r"\bmein\s+(?:aktuelles\s+)?projekt\s+(?:heißt|heisst|ist)\s+([^\n,.!?]{2,160})",
         ],
     )
@@ -127,7 +131,147 @@ def _extract_structured_facts(message: str):
 
     return facts
 
+
+def _extract_memory_control(message: str):
+    explicit_forget_patterns = [
+        r"(?:انسَ|انس|انسى|احذف|امسح)\s+(?:من\s+ذاكرتك\s+)?(?:أن|ان)\s+(.+)",
+        r"\bforget\s+that\s+(.+)",
+        r"\b(?:vergiss|lösche)\s+(?:bitte\s+)?dass\s+(.+)",
+    ]
+    for pattern in explicit_forget_patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            value = _clean_value(match.group(1))
+            if value:
+                return ("forget_explicit", None, value)
+
+    forget_targets = [
+        ("name", [
+            r"(?:انسَ|انس|انسى|احذف|امسح)\s+(?:من\s+ذاكرتك\s+)?(?:اسمي|اسمِي|اسم\s+العرض)(?:\s+المحفوظ)?\s*$",
+            r"\b(?:forget|delete|remove)\s+my\s+(?:saved\s+)?name\s*$",
+            r"\b(?:vergiss|lösche)\s+(?:meinen\s+)?namen\s*$",
+        ]),
+        ("company", [
+            r"(?:انسَ|انس|انسى|احذف|امسح)\s+(?:من\s+ذاكرتك\s+)?(?:اسم\s+)?شركتي\s*$",
+            r"\b(?:forget|delete|remove)\s+my\s+company(?:\s+name)?\s*$",
+            r"\b(?:vergiss|lösche)\s+(?:den\s+namen\s+)?meiner\s+firma\s*$",
+        ]),
+        ("role", [
+            r"(?:انسَ|انس|انسى|احذف|امسح)\s+(?:من\s+ذاكرتك\s+)?(?:عملي|وظيفتي)\s*$",
+            r"\b(?:forget|delete|remove)\s+my\s+(?:job|role|work)\s*$",
+            r"\b(?:vergiss|lösche)\s+(?:meinen\s+)?(?:beruf|job|rolle)\s*$",
+        ]),
+        ("project", [
+            r"(?:انسَ|انس|انسى|احذف|امسح)\s+(?:من\s+ذاكرتك\s+)?(?:مشروعي|مشروعي\s+الحالي)\s*$",
+            r"\b(?:forget|delete|remove)\s+my\s+(?:current\s+)?project\s*$",
+            r"\b(?:vergiss|lösche)\s+(?:mein\s+)?(?:aktuelles\s+)?projekt\s*$",
+        ]),
+        ("language", [
+            r"(?:انسَ|انس|انسى|احذف|امسح)\s+(?:من\s+ذاكرتك\s+)?(?:لغتي\s+المفضلة|تفضيل\s+اللغة)\s*$",
+            r"\b(?:forget|delete|remove)\s+my\s+preferred\s+language\s*$",
+            r"\b(?:vergiss|lösche)\s+(?:meine\s+)?bevorzugte\s+sprache\s*$",
+        ]),
+    ]
+    for target, patterns in forget_targets:
+        for pattern in patterns:
+            if re.search(pattern, message.strip(), flags=re.IGNORECASE):
+                return ("forget", target, None)
+
+    correction_targets = [
+        ("name", [
+            r"(?:صحح|صحّح|غير|غيّر|عدل|عدّل|حدّث|حدث)\s+(?:اسمي|اسم\s+العرض)\s+(?:إلى|الى|ليصبح|إلى\s+أن\s+يصبح)\s+(.+)",
+            r"\b(?:change|correct|update)\s+my\s+(?:display\s+)?name\s+to\s+(.+)",
+            r"\b(?:ändere|korrigiere|aktualisiere)\s+(?:meinen\s+)?namen\s+(?:zu|auf)\s+(.+)",
+        ]),
+        ("company", [
+            r"(?:صحح|صحّح|غير|غيّر|عدل|عدّل|حدّث|حدث)\s+(?:اسم\s+)?شركتي\s+(?:إلى|الى|ليصبح|إلى\s+أن\s+يصبح)\s+(.+)",
+            r"\b(?:change|correct|update)\s+my\s+company(?:\s+name)?\s+to\s+(.+)",
+            r"\b(?:ändere|korrigiere|aktualisiere)\s+(?:den\s+namen\s+)?meiner\s+firma\s+(?:zu|auf)\s+(.+)",
+        ]),
+        ("role", [
+            r"(?:صحح|صحّح|غير|غيّر|عدل|عدّل|حدّث|حدث)\s+(?:عملي|وظيفتي)\s+(?:إلى|الى|ليصبح|إلى\s+أن\s+يصبح)\s+(.+)",
+            r"\b(?:change|correct|update)\s+my\s+(?:job|role|work)\s+to\s+(.+)",
+            r"\b(?:ändere|korrigiere|aktualisiere)\s+(?:meinen\s+)?(?:beruf|job|rolle)\s+(?:zu|auf)\s+(.+)",
+        ]),
+        ("project", [
+            r"(?:صحح|صحّح|غير|غيّر|عدل|عدّل|حدّث|حدث)\s+(?:مشروعي|مشروعي\s+الحالي)\s+(?:إلى|الى|ليصبح|إلى\s+أن\s+يصبح)\s+(.+)",
+            r"\b(?:change|correct|update)\s+my\s+(?:current\s+)?project\s+to\s+(.+)",
+            r"\b(?:ändere|korrigiere|aktualisiere)\s+(?:mein\s+)?(?:aktuelles\s+)?projekt\s+(?:zu|auf)\s+(.+)",
+        ]),
+        ("language", [
+            r"(?:صحح|صحّح|غير|غيّر|عدل|عدّل|حدّث|حدث)\s+(?:لغتي\s+المفضلة|تفضيل\s+اللغة)\s+(?:إلى|الى|ليصبح|إلى\s+أن\s+يصبح)\s+(.+)",
+            r"\b(?:change|correct|update)\s+my\s+preferred\s+language\s+to\s+(.+)",
+            r"\b(?:ändere|korrigiere|aktualisiere)\s+(?:meine\s+)?bevorzugte\s+sprache\s+(?:zu|auf)\s+(.+)",
+        ]),
+    ]
+    for target, patterns in correction_targets:
+        for pattern in patterns:
+            match = re.search(pattern, message, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                value = _clean_value(match.group(1))
+                if value:
+                    return ("correct", target, value)
+
+    return None
+
+async def _apply_memory_control(user_id: str, control):
+    if not control:
+        return None
+
+    action, target, value = control
+
+    if action == "forget_explicit":
+        deleted = await delete_saved_memory(user_id, value)
+        if deleted:
+            return f"Memory action completed: removed exact saved memory: {value}"
+        return f"Memory action requested, but no exact saved memory matched: {value}"
+
+    if action == "forget":
+        if target == "name":
+            deleted = await clear_display_name(user_id)
+        elif target == "company":
+            deleted = await delete_smart_memory(user_id, "business", "company")
+        elif target == "role":
+            deleted = await delete_smart_memory(user_id, "work", "role")
+        elif target == "project":
+            deleted = await delete_smart_memory(user_id, "project", "current_project")
+        elif target == "language":
+            a = await delete_smart_memory(user_id, "preference", "preferred_language")
+            b = await clear_preferred_language(user_id)
+            deleted = a or b
+        else:
+            deleted = False
+
+        return (
+            f"Memory action completed: removed saved {target}."
+            if deleted
+            else f"Memory action requested, but no saved {target} was found."
+        )
+
+    if action == "correct":
+        if target == "name":
+            await set_display_name(user_id, value)
+        elif target == "company":
+            await upsert_smart_memory(user_id, "business", "company", value, 9)
+        elif target == "role":
+            await upsert_smart_memory(user_id, "work", "role", value, 7)
+        elif target == "project":
+            await upsert_smart_memory(user_id, "project", "current_project", value, 8)
+        elif target == "language":
+            await upsert_smart_memory(
+                user_id, "preference", "preferred_language", value, 8
+            )
+            await set_preferred_language(user_id, value)
+
+        return f"Memory action completed: corrected saved {target} to: {value}"
+
+    return None
+
 async def _capture_user_memory(user_id: str, message: str):
+    control = _extract_memory_control(message)
+    if control:
+        return await _apply_memory_control(user_id, control)
+
     name = _extract_name(message)
     if name:
         await set_display_name(user_id, name)
@@ -140,6 +284,8 @@ async def _capture_user_memory(user_id: str, message: str):
         await upsert_smart_memory(user_id, category, key, value, importance)
         if key == "preferred_language":
             await set_preferred_language(user_id, value)
+
+    return None
 
 async def _persistent_context(user_id: str) -> str:
     profile = await get_profile(user_id)
@@ -183,7 +329,7 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    await _capture_user_memory(req.user_id, req.message)
+    memory_action = await _capture_user_memory(req.user_id, req.message)
     await add_message(req.user_id, "user", req.message)
 
     history = await recent_messages(req.user_id, 10)
@@ -191,8 +337,15 @@ async def chat(req: ChatRequest):
         f"{m['role']}: {m['content']}" for m in history[:-1]
     )
     persistent_context = await _persistent_context(req.user_id)
+    memory_action_context = (
+        f"Internal memory status for this turn: {memory_action}"
+        if memory_action
+        else ""
+    )
     context_text = "\n\n".join(
-        part for part in [persistent_context, recent_context] if part
+        part
+        for part in [persistent_context, memory_action_context, recent_context]
+        if part
     )
 
     if not OPENAI_API_KEY:
