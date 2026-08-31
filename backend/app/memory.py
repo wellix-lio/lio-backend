@@ -85,3 +85,54 @@ async def recent_messages(user_id: str, limit: int = 12):
         )
         rows = await cur.fetchall()
     return list(reversed([{"role": r[0], "content": r[1]} for r in rows]))
+
+async def get_profile(user_id: str):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT display_name, preferred_language FROM user_profile WHERE user_id=?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+    if not row:
+        return {"display_name": None, "preferred_language": "ar"}
+    return {"display_name": row[0], "preferred_language": row[1] or "ar"}
+
+async def set_display_name(user_id: str, display_name: str):
+    name = display_name.strip()
+    if not name:
+        return
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_profile(user_id, display_name)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name
+            """,
+            (user_id, name),
+        )
+        await db.commit()
+
+async def add_memory(user_id: str, content: str):
+    fact = content.strip()
+    if not fact:
+        return
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM memories WHERE user_id=? AND content=? LIMIT 1",
+            (user_id, fact),
+        )
+        if await cur.fetchone() is None:
+            await db.execute(
+                "INSERT INTO memories(user_id, content) VALUES (?, ?)",
+                (user_id, fact),
+            )
+            await db.commit()
+
+async def saved_memories(user_id: str, limit: int = 20):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT content FROM memories WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+        rows = await cur.fetchall()
+    return list(reversed([r[0] for r in rows]))

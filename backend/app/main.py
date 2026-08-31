@@ -1,17 +1,26 @@
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .config import OPENAI_API_KEY, LIO_ALLOWED_ORIGINS
-from .memory import init_db, add_message, recent_messages
+from .memory import (
+    init_db,
+    add_message,
+    recent_messages,
+    get_profile,
+    set_display_name,
+    add_memory,
+    saved_memories,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     yield
 
-app = FastAPI(title="Lio API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Lio API", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +38,59 @@ class ChatResponse(BaseModel):
     reply: str
     mode: str
 
+def _clean_value(value: str) -> str:
+    return value.strip().strip('"\'“”‘’ ').rstrip(".،,!?؟")[:120]
+
+def _extract_name(message: str):
+    patterns = [
+        r"(?:^|\s)(?:أنا\s+)?اسمي\s+([^\n،,.!?؟]{1,80})",
+        r"\bmy\s+name\s+is\s+([^\n,.!?]{1,80})",
+        r"\b(?:ich\s+hei(?:ß|ss)e|mein\s+name\s+ist)\s+([^\n,.!?]{1,80})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            value = _clean_value(match.group(1))
+            if value:
+                return value
+    return None
+
+def _extract_explicit_memory(message: str):
+    patterns = [
+        r"(?:تذكر|تذكّر)\s+(?:أن|ان)\s+(.+)",
+        r"\bremember\s+that\s+(.+)",
+        r"\b(?:merk|merke)\s+dir,?\s+dass\s+(.+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            value = _clean_value(match.group(1))
+            if value:
+                return value[:1000]
+    return None
+
+async def _capture_user_memory(user_id: str, message: str):
+    name = _extract_name(message)
+    if name:
+        await set_display_name(user_id, name)
+
+    fact = _extract_explicit_memory(message)
+    if fact:
+        await add_memory(user_id, fact)
+
+async def _persistent_context(user_id: str) -> str:
+    profile = await get_profile(user_id)
+    memories = await saved_memories(user_id, 20)
+    lines = []
+    if profile.get("display_name"):
+        lines.append(f"User display name: {profile['display_name']}")
+    if memories:
+        lines.append("Saved user memories:")
+        lines.extend(f"- {item}" for item in memories)
+    if not lines:
+        return ""
+    return "Persistent user context (saved from explicit user statements; use when relevant):\n" + "\n".join(lines)
+
 @app.get("/health")
 async def health():
     return {
@@ -40,10 +102,16 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    await _capture_user_memory(req.user_id, req.message)
     await add_message(req.user_id, "user", req.message)
+
     history = await recent_messages(req.user_id, 10)
-    context_text = "\n".join(
+    recent_context = "\n".join(
         f"{m['role']}: {m['content']}" for m in history[:-1]
+    )
+    persistent_context = await _persistent_context(req.user_id)
+    context_text = "\n\n".join(
+        part for part in [persistent_context, recent_context] if part
     )
 
     if not OPENAI_API_KEY:
@@ -61,7 +129,6 @@ async def chat(req: ChatRequest):
         return ChatResponse(reply=reply, mode="live")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lio agent error: {exc}")
-
 
 @app.post("/voice/transcribe")
 async def voice_transcribe(file: UploadFile = File(...)):
@@ -91,7 +158,6 @@ async def voice_speak(req: SpeechRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Speech error: {exc}")
 
-
 class WatchRequest(BaseModel):
     user_id: str = "owner"
     name: str = Field(min_length=1, max_length=200)
@@ -113,7 +179,6 @@ async def create_watch(req: WatchRequest):
 async def get_watches(user_id: str):
     from .watch import list_watches
     return {"items": await list_watches(user_id)}
-
 
 class TaskRequest(BaseModel):
     user_id: str = "owner"
