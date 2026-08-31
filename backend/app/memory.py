@@ -251,18 +251,32 @@ async def clear_preferred_language(user_id: str) -> bool:
         await db.commit()
         return cur.rowcount > 0
 
+def _normalize_memory_text(text: str) -> str:
+    return " ".join((text or "").split()).strip().casefold()
+
 async def delete_saved_memory(user_id: str, content: str) -> bool:
-    fact = content.strip()
-    if not fact:
+    target = _normalize_memory_text(content)
+    if not target:
         return False
+
     async with aiosqlite.connect(LIO_DB_PATH) as db:
         cur = await db.execute(
-            """
-            DELETE FROM memories
-            WHERE user_id=? AND content=?
-            """,
-            (user_id, fact),
+            "SELECT id, content FROM memories WHERE user_id=?",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        ids = [
+            row_id
+            for row_id, saved_content in rows
+            if _normalize_memory_text(saved_content) == target
+        ]
+        if not ids:
+            return False
+
+        await db.executemany(
+            "DELETE FROM memories WHERE id=?",
+            [(row_id,) for row_id in ids],
         )
         await db.commit()
-        return cur.rowcount > 0
+        return True
 
