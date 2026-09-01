@@ -282,6 +282,14 @@ def _commercial_number(value: str):
         return None
 
 
+def _clean_commercial_supplier_name(value: str | None):
+    if not value:
+        return value
+    value = value.strip().strip(" -,:،")
+    value = re.sub(r"\s+(?:هي|هو)\s*$", "", value, flags=re.IGNORECASE)
+    return value.strip().strip(" -,:،")
+
+
 def _commercial_save_intent(message: str) -> bool:
     folded = message.casefold()
     save_words = (
@@ -312,6 +320,7 @@ def _extract_commercial_record(message: str):
             r"\b(?:lieferant|fabrik|firma)\s+(?:heißt\s+|heisst\s+|ist\s+)?(.{2,120}?)(?=\s+(?:aus|in|bietet|bot|angebot|preis)\b|[,;\n]|$)",
         ],
     )
+    supplier = _clean_commercial_supplier_name(supplier)
     if not supplier:
         return None
 
@@ -338,6 +347,14 @@ def _extract_commercial_record(message: str):
             r"\b(?:bietet|bot)\s+(.+?)(?=\s+(?:größe|groesse|stärke|staerke|für|preis|MOQ|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[,;\n]|$)",
         ],
     )
+    if product:
+        product = re.sub(
+            r"^(?:عرض\s+سعر|سعر|price\s+quote|quote|angebotspreis|preis)\s+",
+            "",
+            product,
+            flags=re.IGNORECASE,
+        ).strip(" -,:،")
+
     if product and size_match:
         product = re.sub(
             r"(?<!\d)\d{2,4}(?:[.,]\d+)?\s*[xX×*/]\s*\d{2,4}(?:[.,]\d+)?(?!\d)",
@@ -353,7 +370,13 @@ def _extract_commercial_record(message: str):
         product = product_keyword.group(0) if product_keyword else None
 
     price_match = re.search(
-        r"(?:بسعر|السعر|سعر|price|at|preis|für|fuer)\s*[:=]?\s*"
+        r"(?:"
+        r"بسعر(?:\s+(?:المتر|المتر\s+المربع|متر|متر\s+مربع|الوحدة))?"
+        r"|سعر\s+(?:المتر|المتر\s+المربع|متر|متر\s+مربع|الوحدة)"
+        r"|السعر|سعر"
+        r"|price(?:\s+per\s+(?:m2|m²|sqm|unit))?"
+        r"|at|preis(?:\s+pro\s+(?:m2|m²|qm|stück|stueck))?|für|fuer"
+        r")\s*[:=]?\s*"
         r"([0-9٠-٩۰-۹]+(?:[.,][0-9٠-٩۰-۹]+)?)\s*"
         r"(USD|US\$|\$|EUR|€|CNY|RMB|دولار(?:\s+أمريكي)?|يورو|يوان)?",
         message,
@@ -440,7 +463,8 @@ def _extract_commercial_record(message: str):
     city = _first_match(
         message,
         [
-            r"(?:من|في|بمدينة)\s+([^\n،,.]{2,60}?)(?=\s+(?:في|بالصين|بتركيا|بإسبانيا|باسبانيا|عرض|قدّم|قدم|يقدم|يبيع|بسعر|سعر)\b|[،,.]|$)",
+            r"(?:من\s+مدينة|في\s+مدينة|بمدينة|مدينة)\s+([^\s\n،,.]{2,60})",
+            r"(?:من|في)\s+([^\n،,.]{2,60}?)(?=\s+(?:في|بالصين|بتركيا|بإسبانيا|باسبانيا|عرض|قدّم|قدم|يقدم|يبيع|بسعر|سعر)\b|[،,.]|$)",
             r"\b(?:from|in)\s+([A-Za-zÀ-ÿ' -]{2,60}?)(?=\s+(?:in|china|turkey|spain|offered|quoted|offers|sells|at)\b|[,.;]|$)",
             r"\b(?:aus|in)\s+([A-Za-zÀ-ÿ' -]{2,60}?)(?=\s+(?:in|china|türkei|spanien|bietet|bot|preis)\b|[,.;]|$)",
         ],
