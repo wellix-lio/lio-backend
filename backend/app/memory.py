@@ -74,6 +74,73 @@ CREATE TABLE IF NOT EXISTS approvals (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS commercial_suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    country TEXT,
+    city TEXT,
+    website TEXT,
+    contact_name TEXT,
+    email TEXT,
+    phone TEXT,
+    supplier_type TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS commercial_products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    supplier_id INTEGER,
+    product_name TEXT NOT NULL,
+    category TEXT,
+    size TEXT,
+    thickness_mm REAL,
+    finish TEXT,
+    color TEXT,
+    model TEXT,
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(supplier_id) REFERENCES commercial_suppliers(id)
+);
+
+CREATE TABLE IF NOT EXISTS commercial_offers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    supplier_id INTEGER,
+    product_id INTEGER,
+    price REAL,
+    currency TEXT,
+    price_unit TEXT,
+    quantity REAL,
+    moq REAL,
+    incoterm TEXT,
+    payment_terms TEXT,
+    quote_date TEXT,
+    valid_until TEXT,
+    lead_time_days INTEGER,
+    status TEXT NOT NULL DEFAULT 'received',
+    source TEXT,
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(supplier_id) REFERENCES commercial_suppliers(id),
+    FOREIGN KEY(product_id) REFERENCES commercial_products(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_suppliers_user
+ON commercial_suppliers(user_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_products_user
+ON commercial_products(user_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_offers_user
+ON commercial_offers(user_id, created_at);
 """
 
 async def init_db():
@@ -280,3 +347,226 @@ async def delete_saved_memory(user_id: str, content: str) -> bool:
         await db.commit()
         return True
 
+async def upsert_commercial_supplier(
+    user_id: str,
+    name: str,
+    country: str | None = None,
+    city: str | None = None,
+    website: str | None = None,
+    contact_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    supplier_type: str | None = None,
+    status: str = "active",
+    notes: str | None = None,
+) -> int:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Supplier name is required")
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO commercial_suppliers(
+                user_id, name, country, city, website, contact_name,
+                email, phone, supplier_type, status, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, name)
+            DO UPDATE SET
+                country=COALESCE(excluded.country, commercial_suppliers.country),
+                city=COALESCE(excluded.city, commercial_suppliers.city),
+                website=COALESCE(excluded.website, commercial_suppliers.website),
+                contact_name=COALESCE(excluded.contact_name, commercial_suppliers.contact_name),
+                email=COALESCE(excluded.email, commercial_suppliers.email),
+                phone=COALESCE(excluded.phone, commercial_suppliers.phone),
+                supplier_type=COALESCE(excluded.supplier_type, commercial_suppliers.supplier_type),
+                status=COALESCE(excluded.status, commercial_suppliers.status),
+                notes=COALESCE(excluded.notes, commercial_suppliers.notes),
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                user_id, name, country, city, website, contact_name,
+                email, phone, supplier_type, status, notes
+            ),
+        )
+        cur = await db.execute(
+            "SELECT id FROM commercial_suppliers WHERE user_id=? AND name=?",
+            (user_id, name),
+        )
+        row = await cur.fetchone()
+        await db.commit()
+    return int(row[0])
+
+
+async def add_commercial_product(
+    user_id: str,
+    product_name: str,
+    supplier_id: int | None = None,
+    category: str | None = None,
+    size: str | None = None,
+    thickness_mm: float | None = None,
+    finish: str | None = None,
+    color: str | None = None,
+    model: str | None = None,
+    notes: str | None = None,
+) -> int:
+    product_name = (product_name or "").strip()
+    if not product_name:
+        raise ValueError("Product name is required")
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO commercial_products(
+                user_id, supplier_id, product_name, category, size,
+                thickness_mm, finish, color, model, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, supplier_id, product_name, category, size,
+                thickness_mm, finish, color, model, notes
+            ),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
+
+
+async def add_commercial_offer(
+    user_id: str,
+    supplier_id: int | None = None,
+    product_id: int | None = None,
+    price: float | None = None,
+    currency: str | None = None,
+    price_unit: str | None = None,
+    quantity: float | None = None,
+    moq: float | None = None,
+    incoterm: str | None = None,
+    payment_terms: str | None = None,
+    quote_date: str | None = None,
+    valid_until: str | None = None,
+    lead_time_days: int | None = None,
+    status: str = "received",
+    source: str | None = None,
+    notes: str | None = None,
+) -> int:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO commercial_offers(
+                user_id, supplier_id, product_id, price, currency, price_unit,
+                quantity, moq, incoterm, payment_terms, quote_date, valid_until,
+                lead_time_days, status, source, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, supplier_id, product_id, price, currency, price_unit,
+                quantity, moq, incoterm, payment_terms, quote_date, valid_until,
+                lead_time_days, status, source, notes
+            ),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
+
+
+async def get_commercial_memory(
+    user_id: str,
+    supplier_limit: int = 10,
+    offer_limit: int = 20,
+):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        suppliers_cur = await db.execute(
+            """
+            SELECT id, name, country, city, website, contact_name, email, phone,
+                   supplier_type, status, notes, updated_at
+            FROM commercial_suppliers
+            WHERE user_id=?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, supplier_limit),
+        )
+        supplier_rows = await suppliers_cur.fetchall()
+
+        offers_cur = await db.execute(
+            """
+            SELECT
+                o.id,
+                s.name,
+                p.product_name,
+                p.size,
+                p.thickness_mm,
+                o.price,
+                o.currency,
+                o.price_unit,
+                o.quantity,
+                o.moq,
+                o.incoterm,
+                o.payment_terms,
+                o.quote_date,
+                o.valid_until,
+                o.lead_time_days,
+                o.status,
+                o.source,
+                o.notes,
+                o.created_at
+            FROM commercial_offers o
+            LEFT JOIN commercial_suppliers s ON s.id=o.supplier_id
+            LEFT JOIN commercial_products p ON p.id=o.product_id
+            WHERE o.user_id=?
+            ORDER BY
+                CASE WHEN o.quote_date IS NULL OR o.quote_date='' THEN 1 ELSE 0 END,
+                o.quote_date DESC,
+                o.id DESC
+            LIMIT ?
+            """,
+            (user_id, offer_limit),
+        )
+        offer_rows = await offers_cur.fetchall()
+
+    suppliers = [
+        {
+            "id": r[0],
+            "name": r[1],
+            "country": r[2],
+            "city": r[3],
+            "website": r[4],
+            "contact_name": r[5],
+            "email": r[6],
+            "phone": r[7],
+            "supplier_type": r[8],
+            "status": r[9],
+            "notes": r[10],
+            "updated_at": r[11],
+        }
+        for r in supplier_rows
+    ]
+
+    offers = [
+        {
+            "id": r[0],
+            "supplier": r[1],
+            "product": r[2],
+            "size": r[3],
+            "thickness_mm": r[4],
+            "price": r[5],
+            "currency": r[6],
+            "price_unit": r[7],
+            "quantity": r[8],
+            "moq": r[9],
+            "incoterm": r[10],
+            "payment_terms": r[11],
+            "quote_date": r[12],
+            "valid_until": r[13],
+            "lead_time_days": r[14],
+            "status": r[15],
+            "source": r[16],
+            "notes": r[17],
+            "created_at": r[18],
+        }
+        for r in offer_rows
+    ]
+
+    return {"suppliers": suppliers, "offers": offers}
