@@ -1,4 +1,5 @@
 from agents import Agent, Runner, WebSearchTool
+from datetime import datetime, timezone
 from .config import OPENAI_DEFAULT_MODEL
 
 BASE_RULES = """
@@ -31,8 +32,12 @@ research_agent = Agent(
     model=OPENAI_DEFAULT_MODEL,
     instructions=BASE_RULES + """
 You specialize in research, verification, comparison, and current web information.
-Use web search when current information is needed.
-Return concise findings with clear uncertainty when applicable.
+Use web search whenever the user asks for current, latest, today, recent, live, price, rate, availability, news, company status, or other time-sensitive information.
+For time-sensitive requests, explicitly check the date of the data you found. Do not present an old result as current merely because it ranks highly in search.
+Prefer primary and official sources when available. For volatile facts such as exchange rates, prices, schedules, availability, and news, use the newest reliable data available and state the data date/time when useful.
+If the newest source you can verify is not from today, clearly say how old it is instead of calling it current.
+When search results conflict, compare them and prefer the most recent authoritative source; mention meaningful uncertainty.
+Return concise findings and identify the source or sources used.
 """,
     tools=[WebSearchTool()],
 )
@@ -102,8 +107,13 @@ say exactly what is missing and continue with everything else you can do.
 )
 
 async def run_lio(message: str, context_text: str = "") -> str:
-    prompt = message
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    prompt = f"Current date/time: {now_utc}\n\nUser request:\n{message}"
     if context_text:
-        prompt = f"Recent conversation context:\n{context_text}\n\nUser request:\n{message}"
+        prompt = (
+            f"Current date/time: {now_utc}\n\n"
+            f"Recent conversation context:\n{context_text}\n\n"
+            f"User request:\n{message}"
+        )
     result = await Runner.run(lio, prompt)
     return str(result.final_output)
