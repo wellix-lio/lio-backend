@@ -623,3 +623,338 @@ async def get_commercial_supplier_languages(user_id: str, supplier_ids: list[int
     for supplier_id, language in rows:
         result.setdefault(int(supplier_id), []).append(language)
     return result
+
+async def find_commercial_suppliers(
+    user_id: str,
+    name_query: str,
+    limit: int = 10,
+):
+    name_query = (name_query or "").strip()
+    if not name_query:
+        return []
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cur = await db.execute(
+            """
+            SELECT id, name, country, city, website, contact_name, email, phone,
+                   supplier_type, status, notes, updated_at
+            FROM commercial_suppliers
+            WHERE user_id=? AND name=?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, name_query, limit),
+        )
+        rows = await cur.fetchall()
+
+        if not rows:
+            cur = await db.execute(
+                """
+                SELECT id, name, country, city, website, contact_name, email, phone,
+                       supplier_type, status, notes, updated_at
+                FROM commercial_suppliers
+                WHERE user_id=? AND name LIKE ?
+                ORDER BY
+                    CASE
+                        WHEN name LIKE ? THEN 0
+                        WHEN name LIKE ? THEN 1
+                        ELSE 2
+                    END,
+                    updated_at DESC,
+                    id DESC
+                LIMIT ?
+                """,
+                (
+                    user_id,
+                    f"%{name_query}%",
+                    f"{name_query}%",
+                    f"%{name_query}",
+                    limit,
+                ),
+            )
+            rows = await cur.fetchall()
+
+    return [dict(row) for row in rows]
+
+
+async def get_commercial_offer_by_id(user_id: str, offer_id: int):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT
+                o.id,
+                o.supplier_id,
+                o.product_id,
+                s.name AS supplier,
+                p.product_name AS product,
+                p.size,
+                p.thickness_mm,
+                o.price,
+                o.currency,
+                o.price_unit,
+                o.quantity,
+                o.moq,
+                o.incoterm,
+                o.payment_terms,
+                o.quote_date,
+                o.valid_until,
+                o.lead_time_days,
+                o.status,
+                o.source,
+                o.notes,
+                o.created_at
+            FROM commercial_offers o
+            LEFT JOIN commercial_suppliers s ON s.id=o.supplier_id
+            LEFT JOIN commercial_products p ON p.id=o.product_id
+            WHERE o.user_id=? AND o.id=?
+            """,
+            (user_id, int(offer_id)),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_latest_commercial_offer(user_id: str, supplier_id: int):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT
+                o.id,
+                o.supplier_id,
+                o.product_id,
+                s.name AS supplier,
+                p.product_name AS product,
+                p.size,
+                p.thickness_mm,
+                o.price,
+                o.currency,
+                o.price_unit,
+                o.quantity,
+                o.moq,
+                o.incoterm,
+                o.payment_terms,
+                o.quote_date,
+                o.valid_until,
+                o.lead_time_days,
+                o.status,
+                o.source,
+                o.notes,
+                o.created_at
+            FROM commercial_offers o
+            LEFT JOIN commercial_suppliers s ON s.id=o.supplier_id
+            LEFT JOIN commercial_products p ON p.id=o.product_id
+            WHERE o.user_id=? AND o.supplier_id=?
+            ORDER BY
+                CASE WHEN o.quote_date IS NULL OR o.quote_date='' THEN 1 ELSE 0 END,
+                o.quote_date DESC,
+                o.id DESC
+            LIMIT 1
+            """,
+            (user_id, int(supplier_id)),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def update_commercial_supplier(
+    user_id: str,
+    supplier_id: int,
+    **changes,
+):
+    allowed = {
+        "name",
+        "country",
+        "city",
+        "website",
+        "contact_name",
+        "email",
+        "phone",
+        "supplier_type",
+        "status",
+        "notes",
+    }
+    clean = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in changes.items()
+        if key in allowed and value is not None
+    }
+    if not clean:
+        return False
+
+    assignments = ", ".join(f"{key}=?" for key in clean)
+    values = list(clean.values())
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            f"""
+            UPDATE commercial_suppliers
+            SET {assignments}, updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND id=?
+            """,
+            (*values, user_id, int(supplier_id)),
+        )
+        changed = cur.rowcount > 0
+        if changed:
+            await db.execute(
+                """
+                INSERT INTO audit_log(user_id, event_type, detail)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    "commercial_supplier_updated",
+                    f"supplier_id={int(supplier_id)}; changes={clean}",
+                ),
+            )
+        await db.commit()
+    return changed
+
+
+async def update_commercial_product(
+    user_id: str,
+    product_id: int,
+    **changes,
+):
+    allowed = {
+        "product_name",
+        "category",
+        "size",
+        "thickness_mm",
+        "finish",
+        "color",
+        "model",
+        "notes",
+    }
+    clean = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in changes.items()
+        if key in allowed and value is not None
+    }
+    if not clean:
+        return False
+
+    assignments = ", ".join(f"{key}=?" for key in clean)
+    values = list(clean.values())
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            f"""
+            UPDATE commercial_products
+            SET {assignments}, updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND id=?
+            """,
+            (*values, user_id, int(product_id)),
+        )
+        changed = cur.rowcount > 0
+        if changed:
+            await db.execute(
+                """
+                INSERT INTO audit_log(user_id, event_type, detail)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    "commercial_product_updated",
+                    f"product_id={int(product_id)}; changes={clean}",
+                ),
+            )
+        await db.commit()
+    return changed
+
+
+async def update_commercial_offer(
+    user_id: str,
+    offer_id: int,
+    **changes,
+):
+    allowed = {
+        "price",
+        "currency",
+        "price_unit",
+        "quantity",
+        "moq",
+        "incoterm",
+        "payment_terms",
+        "quote_date",
+        "valid_until",
+        "lead_time_days",
+        "status",
+        "source",
+        "notes",
+    }
+    clean = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in changes.items()
+        if key in allowed and value is not None
+    }
+    if not clean:
+        return False
+
+    assignments = ", ".join(f"{key}=?" for key in clean)
+    values = list(clean.values())
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            f"""
+            UPDATE commercial_offers
+            SET {assignments}
+            WHERE user_id=? AND id=?
+            """,
+            (*values, user_id, int(offer_id)),
+        )
+        changed = cur.rowcount > 0
+        if changed:
+            await db.execute(
+                """
+                INSERT INTO audit_log(user_id, event_type, detail)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    "commercial_offer_updated",
+                    f"offer_id={int(offer_id)}; changes={clean}",
+                ),
+            )
+        await db.commit()
+    return changed
+
+
+async def delete_commercial_offer(user_id: str, offer_id: int):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, supplier_id, product_id, price, currency, price_unit,
+                   quantity, moq, incoterm, payment_terms, quote_date,
+                   valid_until, lead_time_days, status, source, notes
+            FROM commercial_offers
+            WHERE user_id=? AND id=?
+            """,
+            (user_id, int(offer_id)),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return False
+
+        snapshot = dict(row)
+        await db.execute(
+            "DELETE FROM commercial_offers WHERE user_id=? AND id=?",
+            (user_id, int(offer_id)),
+        )
+        await db.execute(
+            """
+            INSERT INTO audit_log(user_id, event_type, detail)
+            VALUES (?, ?, ?)
+            """,
+            (
+                user_id,
+                "commercial_offer_deleted",
+                f"offer_id={int(offer_id)}; snapshot={snapshot}",
+            ),
+        )
+        await db.commit()
+    return True

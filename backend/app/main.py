@@ -25,6 +25,12 @@ from .memory import (
     add_commercial_offer,
     add_commercial_supplier_language,
     get_commercial_supplier_languages,
+    find_commercial_suppliers,
+    get_commercial_offer_by_id,
+    get_latest_commercial_offer,
+    update_commercial_supplier,
+    update_commercial_offer,
+    delete_commercial_offer,
     get_commercial_memory,
 )
 
@@ -575,6 +581,284 @@ async def _capture_commercial_memory(user_id: str, message: str):
     return "Commercial memory saved: " + "; ".join(saved_parts)
 
 
+def _normalize_management_supplier_query(value: str | None):
+    if not value:
+        return None
+    value = _clean_value(value).strip()
+    replacements = (
+        ("للسيدة ", "السيدة "),
+        ("للسيد ", "السيد "),
+        ("لشركة ", "شركة "),
+        ("للمورد ", ""),
+        ("للمصنع ", ""),
+        ("للشركة ", ""),
+    )
+    for prefix, replacement in replacements:
+        if value.startswith(prefix):
+            value = replacement + value[len(prefix):]
+            break
+    return value.strip(" -,:،")
+
+
+def _extract_management_currency(message: str):
+    match = re.search(
+        r"\b(USD|EUR|CNY|RMB)\b|US\$|\$|€|دولار(?:\s+أمريكي)?|يورو|يوان",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    raw = match.group(0).casefold()
+    if raw in ("usd", "us$", "$") or "دولار" in raw:
+        return "USD"
+    if raw in ("eur", "€") or "يورو" in raw:
+        return "EUR"
+    if raw in ("cny", "rmb") or "يوان" in raw:
+        return "CNY"
+    return None
+
+
+def _extract_management_price(message: str):
+    patterns = [
+        r"(?:إلى|الى|ليصبح|بسعر|سعر|price\s+to|to|auf|preis)\s*[:=]?\s*([0-9٠-٩۰-۹]+(?:[.,][0-9٠-٩۰-۹]+)?)",
+        r"([0-9٠-٩۰-۹]+(?:[.,][0-9٠-٩۰-۹]+)?)\s*(?:USD|US\$|\$|EUR|€|CNY|RMB|دولار|يورو|يوان)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            return _commercial_number(match.group(1))
+    return None
+
+
+async def _resolve_management_supplier(user_id: str, supplier_query: str | None):
+    supplier_query = _normalize_management_supplier_query(supplier_query)
+    if not supplier_query:
+        return None, "Commercial management not applied: supplier name was not clear."
+
+    matches = await find_commercial_suppliers(user_id, supplier_query, 10)
+    if not matches:
+        return None, f"Commercial management not applied: no saved supplier matched: {supplier_query}"
+    if len(matches) > 1:
+        names = ", ".join(item["name"] for item in matches[:5])
+        return None, (
+            "Commercial management not applied: supplier name is ambiguous. "
+            f"Matches: {names}"
+        )
+    return matches[0], None
+
+
+def _extract_latest_offer_supplier_query(message: str):
+    return _first_match(
+        message,
+        [
+            r"(?:العرض\s+(?:الأخير|الاخير|الأحدث|الاحدث))\s+(.+?)(?=\s+(?:إلى|الى|ليصبح|بسعر|سعر|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[،,;]|$)",
+            r"\b(?:latest|most\s+recent)\s+offer\s+(?:for|from)\s+(.+?)(?=\s+(?:to|at|price|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[,;]|$)",
+            r"\b(?:letztes|neueste[sr]?)\s+angebot\s+(?:von|für|fuer)\s+(.+?)(?=\s+(?:auf|zu|preis|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[,;]|$)",
+        ],
+    )
+
+
+async def _capture_commercial_management(user_id: str, message: str):
+    folded = message.casefold()
+
+    delete_words = (
+        "احذف", "امسح", "أزل", "ازل",
+        "delete", "remove",
+        "lösche", "loesche", "entferne",
+    )
+    correction_words = (
+        "صحح", "صحّح", "غير", "غيّر", "عدل", "عدّل", "حدث", "حدّث",
+        "correct", "change", "update",
+        "korrigiere", "ändere", "aendere", "aktualisiere",
+    )
+    add_offer_words = (
+        "أضف عرض", "اضف عرض",
+        "add offer", "add a new offer", "add new offer",
+        "neues angebot", "angebot hinzufügen", "angebot hinzufuegen",
+    )
+
+    if any(word in folded for word in delete_words) and (
+        "عرض" in folded or "offer" in folded or "angebot" in folded
+    ):
+        id_match = re.search(
+            r"(?:عرض|offer|angebot)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if id_match:
+            offer_id = int(id_match.group(1))
+            offer = await get_commercial_offer_by_id(user_id, offer_id)
+            if not offer:
+                return f"Commercial management not applied: offer #{offer_id} was not found."
+            deleted = await delete_commercial_offer(user_id, offer_id)
+            return (
+                f"Commercial offer deleted: offer_id={offer_id}; supplier={offer.get('supplier')}"
+                if deleted
+                else f"Commercial management not applied: offer #{offer_id} could not be deleted."
+            )
+
+        if any(token in folded for token in ("الأخير", "الاخير", "latest", "most recent", "letztes", "neueste")):
+            supplier_query = _extract_latest_offer_supplier_query(message)
+            supplier, error = await _resolve_management_supplier(user_id, supplier_query)
+            if error:
+                return error
+            offer = await get_latest_commercial_offer(user_id, supplier["id"])
+            if not offer:
+                return f"Commercial management not applied: no saved offer exists for supplier {supplier['name']}."
+            deleted = await delete_commercial_offer(user_id, offer["id"])
+            return (
+                f"Commercial offer deleted: offer_id={offer['id']}; supplier={supplier['name']}"
+                if deleted
+                else "Commercial management not applied: deletion failed."
+            )
+
+        return (
+            "Commercial management not applied: deletion requires a specific offer ID "
+            "or the explicit latest offer of one supplier."
+        )
+
+    if any(word in folded for word in correction_words) and (
+        "عرض" in folded or "offer" in folded or "angebot" in folded
+    ):
+        id_match = re.search(
+            r"(?:عرض|offer|angebot)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if id_match:
+            offer = await get_commercial_offer_by_id(user_id, int(id_match.group(1)))
+            if not offer:
+                return f"Commercial management not applied: offer #{int(id_match.group(1))} was not found."
+        else:
+            supplier_query = _extract_latest_offer_supplier_query(message)
+            supplier, error = await _resolve_management_supplier(user_id, supplier_query)
+            if error:
+                return error
+            offer = await get_latest_commercial_offer(user_id, supplier["id"])
+            if not offer:
+                return f"Commercial management not applied: no saved offer exists for supplier {supplier['name']}."
+
+        changes = {}
+        if any(token in folded for token in ("سعر", "price", "preis")):
+            price = _extract_management_price(message)
+            if price is None:
+                return "Commercial management not applied: the new price was not clear."
+            changes["price"] = price
+            currency = _extract_management_currency(message)
+            if currency:
+                changes["currency"] = currency
+
+        incoterm_match = re.search(
+            r"\b(EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if any(token in folded for token in ("incoterm", "شرط التسليم", "شروط التسليم")) and incoterm_match:
+            changes["incoterm"] = incoterm_match.group(1).upper()
+
+        if not changes:
+            return (
+                "Commercial management not applied: this v1 update supports "
+                "offer price/currency and Incoterm."
+            )
+
+        changed = await update_commercial_offer(user_id, offer["id"], **changes)
+        return (
+            f"Commercial offer updated: offer_id={offer['id']}; changes={changes}"
+            if changed
+            else "Commercial management not applied: offer update failed."
+        )
+
+    if any(word in folded for word in add_offer_words):
+        supplier_query = _first_match(
+            message,
+            [
+                r"(?:أضف|اضف)\s+عرض(?:اً|ا)?\s+جديد(?:اً|ا)?\s+(.+?)(?=\s+(?:بسعر|سعر|بقيمة|بمبلغ|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[،,;]|$)",
+                r"\badd\s+(?:a\s+)?new\s+offer\s+(?:for|from)\s+(.+?)(?=\s+(?:at|price|for|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[,;]|$)",
+                r"\bneues\s+angebot\s+(?:von|für|fuer)\s+(.+?)(?=\s+(?:für|fuer|preis|EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b|[,;]|$)",
+            ],
+        )
+        supplier, error = await _resolve_management_supplier(user_id, supplier_query)
+        if error:
+            return error
+
+        latest = await get_latest_commercial_offer(user_id, supplier["id"])
+        price = _extract_management_price(message)
+        currency = _extract_management_currency(message)
+        incoterm_match = re.search(
+            r"\b(EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
+
+        if price is None and not incoterm_match:
+            return "Commercial management not applied: the new offer needs at least a price or Incoterm."
+
+        offer_id = await add_commercial_offer(
+            user_id,
+            supplier_id=supplier["id"],
+            product_id=latest.get("product_id") if latest else None,
+            price=price,
+            currency=currency or (latest.get("currency") if latest else None),
+            price_unit=latest.get("price_unit") if latest else None,
+            incoterm=(
+                incoterm_match.group(1).upper()
+                if incoterm_match
+                else (latest.get("incoterm") if latest else None)
+            ),
+            source="user_management_command",
+        )
+        return f"Commercial offer added: offer_id={offer_id}; supplier={supplier['name']}; price={price}"
+
+    if any(word in folded for word in correction_words) and (
+        "مورد" in folded or "supplier" in folded or "lieferant" in folded
+    ):
+        field_patterns = [
+            ("city", [
+                r"(?:مدينة|المدينة)\s+(?:المورد\s+)?(.+?)\s+(?:إلى|الى|ليصبح)\s+(.+)$",
+                r"\bcity\s+(?:of\s+)?(?:supplier\s+)?(.+?)\s+to\s+(.+)$",
+                r"\bstadt\s+(?:des\s+)?lieferanten\s+(.+?)\s+(?:auf|zu)\s+(.+)$",
+            ]),
+            ("country", [
+                r"(?:بلد|الدولة|دولة)\s+(?:المورد\s+)?(.+?)\s+(?:إلى|الى|ليصبح)\s+(.+)$",
+                r"\bcountry\s+(?:of\s+)?(?:supplier\s+)?(.+?)\s+to\s+(.+)$",
+                r"\bland\s+(?:des\s+)?lieferanten\s+(.+?)\s+(?:auf|zu)\s+(.+)$",
+            ]),
+            ("email", [
+                r"(?:ايميل|إيميل|البريد\s+الإلكتروني)\s+(?:للمورد\s+)?(.+?)\s+(?:إلى|الى|ليصبح)\s+(\S+)$",
+                r"\bemail\s+(?:of\s+)?(?:supplier\s+)?(.+?)\s+to\s+(\S+)$",
+                r"\be-?mail\s+(?:des\s+)?lieferanten\s+(.+?)\s+(?:auf|zu)\s+(\S+)$",
+            ]),
+            ("phone", [
+                r"(?:هاتف|رقم\s+هاتف|تلفون)\s+(?:المورد\s+)?(.+?)\s+(?:إلى|الى|ليصبح)\s+([+\d][\d\s().-]+)$",
+                r"\bphone\s+(?:of\s+)?(?:supplier\s+)?(.+?)\s+to\s+([+\d][\d\s().-]+)$",
+                r"\btelefon\s+(?:des\s+)?lieferanten\s+(.+?)\s+(?:auf|zu)\s+([+\d][\d\s().-]+)$",
+            ]),
+        ]
+
+        for field, patterns in field_patterns:
+            for pattern in patterns:
+                match = re.search(pattern, message, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                supplier, error = await _resolve_management_supplier(user_id, match.group(1))
+                if error:
+                    return error
+                value = _clean_value(match.group(2))
+                if not value:
+                    return "Commercial management not applied: new value was empty."
+                changed = await update_commercial_supplier(
+                    user_id, supplier["id"], **{field: value}
+                )
+                return (
+                    f"Commercial supplier updated: supplier={supplier['name']}; {field}={value}"
+                    if changed
+                    else "Commercial management not applied: supplier update failed."
+                )
+
+    return None
+
+
 async def _capture_user_memory(user_id: str, message: str):
     control = _extract_memory_control(message)
     if control:
@@ -583,6 +867,10 @@ async def _capture_user_memory(user_id: str, message: str):
     name = _extract_name(message)
     if name:
         await set_display_name(user_id, name)
+
+    management_action = await _capture_commercial_management(user_id, message)
+    if management_action:
+        return management_action
 
     commercial_action = await _capture_commercial_memory(user_id, message)
 
