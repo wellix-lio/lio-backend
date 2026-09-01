@@ -141,6 +141,19 @@ ON commercial_products(user_id, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_commercial_offers_user
 ON commercial_offers(user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS commercial_supplier_languages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    supplier_id INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, supplier_id, language),
+    FOREIGN KEY(supplier_id) REFERENCES commercial_suppliers(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_supplier_languages_user
+ON commercial_supplier_languages(user_id, supplier_id);
 """
 
 async def init_db():
@@ -570,3 +583,43 @@ async def get_commercial_memory(
     ]
 
     return {"suppliers": suppliers, "offers": offers}
+
+async def add_commercial_supplier_language(
+    user_id: str,
+    supplier_id: int,
+    language: str,
+):
+    language = (language or "").strip()
+    if not language:
+        return
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO commercial_supplier_languages(
+                user_id, supplier_id, language
+            )
+            VALUES (?, ?, ?)
+            """,
+            (user_id, supplier_id, language),
+        )
+        await db.commit()
+
+
+async def get_commercial_supplier_languages(user_id: str, supplier_ids: list[int]):
+    if not supplier_ids:
+        return {}
+    placeholders = ",".join("?" for _ in supplier_ids)
+    query = f"""
+        SELECT supplier_id, language
+        FROM commercial_supplier_languages
+        WHERE user_id=? AND supplier_id IN ({placeholders})
+        ORDER BY supplier_id, language
+    """
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(query, (user_id, *supplier_ids))
+        rows = await cur.fetchall()
+
+    result = {}
+    for supplier_id, language in rows:
+        result.setdefault(int(supplier_id), []).append(language)
+    return result

@@ -23,6 +23,8 @@ from .memory import (
     upsert_commercial_supplier,
     add_commercial_product,
     add_commercial_offer,
+    add_commercial_supplier_language,
+    get_commercial_supplier_languages,
     get_commercial_memory,
 )
 
@@ -446,6 +448,21 @@ def _extract_commercial_record(message: str):
         else:
             quote_date = f"{int(date_match.group(6)):04d}-{int(date_match.group(5)):02d}-{int(date_match.group(4)):02d}"
 
+    languages = []
+    language_map = [
+        (r"(?:الانكليزية|الإنكليزية|الانجليزية|الإنجليزية|\benglish\b|\benglisch\b)", "English"),
+        (r"(?:الصينية|\bchinese\b|\bchinesisch\b)", "Chinese"),
+        (r"(?:العربية|\barabic\b|\barabisch\b)", "Arabic"),
+        (r"(?:الألمانية|الالمانية|\bgerman\b|\bdeutsch\b)", "German"),
+        (r"(?:الفرنسية|\bfrench\b|\bfranzösisch\b|\bfranzoesisch\b)", "French"),
+        (r"(?:الإسبانية|الاسبانية|\bspanish\b|\bspanisch\b)", "Spanish"),
+        (r"(?:الإيطالية|الايطالية|\bitalian\b|\bitalienisch\b)", "Italian"),
+        (r"(?:التركية|\bturkish\b|\btürkisch\b|\btuerkisch\b)", "Turkish"),
+    ]
+    for pattern, normalized in language_map:
+        if re.search(pattern, message, flags=re.IGNORECASE):
+            languages.append(normalized)
+
     country = None
     country_map = [
         (r"(?:\bchina\b|الصين)", "China"),
@@ -493,6 +510,7 @@ def _extract_commercial_record(message: str):
         "incoterm": incoterm,
         "payment_terms": payment_terms,
         "quote_date": quote_date,
+        "languages": languages,
     }
 
 
@@ -507,6 +525,9 @@ async def _capture_commercial_memory(user_id: str, message: str):
         country=record["country"],
         city=record["city"],
     )
+
+    for language in record.get("languages", []):
+        await add_commercial_supplier_language(user_id, supplier_id, language)
 
     product_id = None
     if record["product"] or record["size"] or record["thickness_mm"] is not None:
@@ -581,6 +602,8 @@ async def _persistent_context(user_id: str) -> str:
     memories = await saved_memories(user_id, 20)
     smart = await get_smart_memories(user_id, 30)
     commercial = await get_commercial_memory(user_id, supplier_limit=10, offer_limit=20)
+    supplier_ids = [item["id"] for item in commercial.get("suppliers", [])]
+    commercial_languages = await get_commercial_supplier_languages(user_id, supplier_ids)
 
     lines = []
     if profile.get("display_name"):
@@ -615,6 +638,11 @@ async def _persistent_context(user_id: str) -> str:
                 f"contact={supplier.get('contact_name')}" if supplier.get("contact_name") else None,
                 f"email={supplier.get('email')}" if supplier.get("email") else None,
                 f"phone={supplier.get('phone')}" if supplier.get("phone") else None,
+                (
+                    "languages=" + ",".join(commercial_languages.get(supplier.get("id"), []))
+                    if commercial_languages.get(supplier.get("id"))
+                    else None
+                ),
                 f"notes={supplier.get('notes')}" if supplier.get("notes") else None,
             ]
             lines.append("- " + "; ".join(item for item in details if item))
