@@ -5,12 +5,12 @@ from .config import OPENAI_API_KEY
 client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 TTS_INSTRUCTIONS = """
-Speak the supplied text exactly in its own language without translating it.
-If the text is Arabic, use a warm, natural conversational Arabic delivery and preserve any colloquial wording that is written.
-If the text is German, use natural Austrian Standard German pronunciation (Deutsch in Österreich / de-AT), not a strong regional dialect unless the text itself clearly calls for one.
-If the text is English, use natural clear English pronunciation.
-Keep names, company names, numbers, and technical terms accurate.
-Sound friendly, calm, and professional, with natural pacing.
+Speak the supplied text in its own language without translating or paraphrasing it.
+For Arabic, sound like a natural educated Arabic speaker rather than a formal announcer or synthetic narrator. Use relaxed conversational pacing for everyday dialogue, natural pauses, sentence melody, and emphasis. Preserve colloquial wording when the text is colloquial. When the text is formal Modern Standard Arabic, pronounce it clearly and fluently without exaggerated classical delivery or artificial case endings that are not written.
+For German, use natural Austrian Standard German pronunciation (Deutsch in Österreich / de-AT), not a strong regional dialect unless the text itself clearly calls for one.
+For English, use natural, conversational English pronunciation.
+Keep names, company names, numbers, units, and technical terms accurate.
+Avoid a robotic cadence, excessive solemnity, and identical rhythm across sentences. Sound warm, calm, confident, and human.
 """
 
 async def transcribe_audio(data: bytes, filename: str = "speech.m4a") -> str:
