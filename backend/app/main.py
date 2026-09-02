@@ -24,7 +24,9 @@ from .memory import (
     delete_saved_memory,
     upsert_commercial_supplier,
     add_commercial_product,
+    find_exact_commercial_product,
     add_commercial_offer,
+    find_exact_commercial_offer,
     add_commercial_supplier_language,
     get_commercial_supplier_languages,
     find_commercial_suppliers,
@@ -789,13 +791,29 @@ async def _capture_commercial_memory(user_id: str, message: str):
 
     product_id = None
     if record["product"] or record["size"] or record["thickness_mm"] is not None:
-        product_id = await add_commercial_product(
+        product_name = record["product"] or "Commercial product"
+        existing_product = await find_exact_commercial_product(
             user_id,
-            record["product"] or "Commercial product",
+            product_name,
             supplier_id=supplier_id,
+            category=None,
             size=record["size"],
             thickness_mm=record["thickness_mm"],
+            finish=None,
+            color=None,
+            model=None,
+            notes=None,
         )
+        if existing_product:
+            product_id = existing_product["id"]
+        else:
+            product_id = await add_commercial_product(
+                user_id,
+                product_name,
+                supplier_id=supplier_id,
+                size=record["size"],
+                thickness_mm=record["thickness_mm"],
+            )
 
     has_offer = any(
         (
@@ -811,8 +829,9 @@ async def _capture_commercial_memory(user_id: str, message: str):
         )
     )
     offer_id = None
+    duplicate_offer = None
     if has_offer:
-        offer_id = await add_commercial_offer(
+        duplicate_offer = await find_exact_commercial_offer(
             user_id,
             supplier_id=supplier_id,
             product_id=product_id,
@@ -826,14 +845,40 @@ async def _capture_commercial_memory(user_id: str, message: str):
             quote_date=record["quote_date"],
             valid_until=record["valid_until"],
             lead_time_days=record["lead_time_days"],
+            status="received",
             source="user_message",
+            notes=None,
         )
+
+        if duplicate_offer:
+            offer_id = duplicate_offer["id"]
+        else:
+            offer_id = await add_commercial_offer(
+                user_id,
+                supplier_id=supplier_id,
+                product_id=product_id,
+                price=record["price"],
+                currency=record["currency"],
+                price_unit=record["price_unit"],
+                quantity=record["quantity"],
+                moq=record["moq"],
+                incoterm=record["incoterm"],
+                payment_terms=record["payment_terms"],
+                quote_date=record["quote_date"],
+                valid_until=record["valid_until"],
+                lead_time_days=record["lead_time_days"],
+                source="user_message",
+            )
 
     saved_parts = [f"supplier={record['supplier']}"]
     if product_id is not None:
         saved_parts.append(f"product={record['product'] or 'Commercial product'}")
     if offer_id is not None:
         saved_parts.append(f"offer_id={offer_id}")
+
+    if duplicate_offer:
+        return "Commercial memory unchanged: exact offer already saved: " + "; ".join(saved_parts)
+
     return "Commercial memory saved: " + "; ".join(saved_parts)
 
 
@@ -2277,6 +2322,68 @@ async def _persistent_context(user_id: str) -> str:
         + "\n".join(lines)
     )
 
+
+def _authoritative_memory_action_reply(memory_action: str | None):
+    if not memory_action:
+        return None
+
+    if memory_action.startswith("Supplier reply handoff recorded:"):
+        save_status = None
+        marker = "commercial_save_status="
+        if marker in memory_action:
+            save_status = memory_action.split(marker, 1)[1].rstrip(".")
+
+        parts = ["Supplier reply recorded for the deal."]
+        if "waiting_on=user" in memory_action:
+            parts.append("The deal is now waiting on you.")
+        if "next_action=Review supplier response and reply" in memory_action:
+            parts.append("Next action: review the supplier response and reply.")
+
+        if save_status:
+            if save_status.startswith("Commercial memory saved:"):
+                details = save_status.split("Commercial memory saved:", 1)[1].strip()
+                parts.append("The commercial offer was saved successfully.")
+                if "offer_id=" in details:
+                    offer_id = details.split("offer_id=", 1)[1].split(";", 1)[0].strip()
+                    parts.append(f"Saved offer ID: {offer_id}.")
+            elif save_status.startswith("Commercial memory unchanged: exact offer already saved:"):
+                details = save_status.split(
+                    "Commercial memory unchanged: exact offer already saved:", 1
+                )[1].strip()
+                parts.append("That exact commercial offer was already saved, so no duplicate offer was created.")
+                if "offer_id=" in details:
+                    offer_id = details.split("offer_id=", 1)[1].split(";", 1)[0].strip()
+                    parts.append(f"Existing offer ID: {offer_id}.")
+            else:
+                parts.append(save_status)
+        elif "Commercial terms in the reply were not saved" in memory_action:
+            parts.append(
+                "Commercial terms from the reply were not saved because you did not explicitly request that."
+            )
+
+        return " ".join(parts)
+
+    if memory_action.startswith("Commercial memory saved:"):
+        details = memory_action.split("Commercial memory saved:", 1)[1].strip()
+        reply = "Commercial data saved successfully."
+        if "offer_id=" in details:
+            offer_id = details.split("offer_id=", 1)[1].split(";", 1)[0].strip()
+            reply += f" Saved offer ID: {offer_id}."
+        return reply
+
+    if memory_action.startswith("Commercial memory unchanged: exact offer already saved:"):
+        details = memory_action.split(
+            "Commercial memory unchanged: exact offer already saved:", 1
+        )[1].strip()
+        reply = "That exact commercial offer is already saved; no duplicate offer was created."
+        if "offer_id=" in details:
+            offer_id = details.split("offer_id=", 1)[1].split(";", 1)[0].strip()
+            reply += f" Existing offer ID: {offer_id}."
+        return reply
+
+    return None
+
+
 @app.get("/health")
 async def health():
     return {
@@ -2290,6 +2397,11 @@ async def health():
 async def chat(req: ChatRequest):
     memory_action = await _capture_user_memory(req.user_id, req.message)
     await add_message(req.user_id, "user", req.message)
+
+    authoritative_reply = _authoritative_memory_action_reply(memory_action)
+    if authoritative_reply:
+        await add_message(req.user_id, "assistant", authoritative_reply)
+        return ChatResponse(reply=authoritative_reply, mode="live")
 
     history = await recent_messages(req.user_id, 10)
     recent_context = "\n".join(

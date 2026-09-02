@@ -454,6 +454,52 @@ async def upsert_commercial_supplier(
     return int(row[0])
 
 
+
+async def find_exact_commercial_product(
+    user_id: str,
+    product_name: str,
+    supplier_id: int | None = None,
+    category: str | None = None,
+    size: str | None = None,
+    thickness_mm: float | None = None,
+    finish: str | None = None,
+    color: str | None = None,
+    model: str | None = None,
+    notes: str | None = None,
+):
+    product_name = (product_name or "").strip()
+    if not product_name:
+        return None
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, user_id, supplier_id, product_name, category, size,
+                   thickness_mm, finish, color, model, notes, created_at
+            FROM commercial_products
+            WHERE user_id=?
+              AND supplier_id IS ?
+              AND product_name=?
+              AND category IS ?
+              AND size IS ?
+              AND thickness_mm IS ?
+              AND finish IS ?
+              AND color IS ?
+              AND model IS ?
+              AND notes IS ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                user_id, supplier_id, product_name, category, size,
+                thickness_mm, finish, color, model, notes,
+            ),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
 async def add_commercial_product(
     user_id: str,
     product_name: str,
@@ -486,6 +532,62 @@ async def add_commercial_product(
         )
         await db.commit()
         return int(cur.lastrowid)
+
+
+
+async def find_exact_commercial_offer(
+    user_id: str,
+    supplier_id: int | None = None,
+    product_id: int | None = None,
+    price: float | None = None,
+    currency: str | None = None,
+    price_unit: str | None = None,
+    quantity: float | None = None,
+    moq: float | None = None,
+    incoterm: str | None = None,
+    payment_terms: str | None = None,
+    quote_date: str | None = None,
+    valid_until: str | None = None,
+    lead_time_days: int | None = None,
+    status: str = "received",
+    source: str | None = None,
+    notes: str | None = None,
+):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, user_id, supplier_id, product_id, price, currency, price_unit,
+                   quantity, moq, incoterm, payment_terms, quote_date, valid_until,
+                   lead_time_days, status, source, notes, created_at
+            FROM commercial_offers
+            WHERE user_id=?
+              AND supplier_id IS ?
+              AND product_id IS ?
+              AND price IS ?
+              AND currency IS ?
+              AND price_unit IS ?
+              AND quantity IS ?
+              AND moq IS ?
+              AND incoterm IS ?
+              AND payment_terms IS ?
+              AND quote_date IS ?
+              AND valid_until IS ?
+              AND lead_time_days IS ?
+              AND status IS ?
+              AND source IS ?
+              AND notes IS ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                user_id, supplier_id, product_id, price, currency, price_unit,
+                quantity, moq, incoterm, payment_terms, quote_date, valid_until,
+                lead_time_days, status, source, notes,
+            ),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 async def add_commercial_offer(
