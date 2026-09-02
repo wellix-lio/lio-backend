@@ -27,6 +27,18 @@ Language behavior:
 - Switch languages automatically when the user switches languages, unless the user explicitly asks for a different output language.
 """
 
+DEAL_FOLLOWUP_CLARITY_RULES = """
+Commercial deal follow-up clarity:
+- When the user asks what is missing, still needed, pending, or unresolved for a saved supplier, offer, or deal, separate facts into clearly labeled categories instead of mixing them.
+- "Missing from saved offer/deal" means only fields that are actually absent or unknown in the persistent commercial data. Typical saved offer fields include price, currency, price unit, quantity, MOQ, Incoterm, payment terms, quote date, validity, and lead time; product/supplier fields may also be missing if relevant.
+- "Open deal-tracking items" means only items explicitly supported by the saved deal status, waiting_on, next_action, or other saved tracking context.
+- "Recommended due diligence" means commercially useful questions or checks that are not saved as supplier-stated facts or explicit deal requirements. Label them as recommendations, not as missing facts.
+- Never describe a recommended certification, test report, inspection term, warranty, packing detail, shipping document, target-market requirement, or similar check as a saved missing requirement unless the persistent context explicitly shows that it was requested or expected.
+- If a value is not present in persistent context, say it is not recorded or not provided; do not imply the supplier refused it or that it was previously requested.
+- Preserve the difference between supplier-stated facts, calculated values, saved deal-tracking facts, and advisory recommendations.
+- Read-only questions such as "what is the next step?" or "what is still missing?" must not be described as having changed or saved data unless an actual persistence action occurred.
+"""
+
 research_agent = Agent(
     name="Lio Research",
     model=OPENAI_DEFAULT_MODEL,
@@ -50,7 +62,7 @@ Return concise findings and identify the source or sources used.
 business_agent = Agent(
     name="Lio Business",
     model=OPENAI_DEFAULT_MODEL,
-    instructions=BASE_RULES + """
+    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + """
 You specialize in commercial tasks: suppliers, offers, procurement, pricing,
 logistics, negotiation preparation, market comparison, and business analysis.
 
@@ -141,7 +153,7 @@ has started unless a monitoring service confirms it.
 lio = Agent(
     name="Lio",
     model=OPENAI_DEFAULT_MODEL,
-    instructions=BASE_RULES + """
+    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + """
 Act as the main orchestrator.
 Choose the right specialist tool for each subtask.
 For supplier discovery, procurement research, commercial comparisons, sourcing, quotations, factories, pricing, or logistics, prefer the business specialist; it can delegate fresh web verification to the research specialist.
