@@ -41,6 +41,12 @@ Commercial deal follow-up clarity:
 - next_action_due is an internal deal-tracking due date. Treat it as the date by which the saved next action should be revisited.
 - A saved next_action_due does not mean an external reminder, push notification, email, or scheduled background task exists. Never claim a notification was scheduled unless a real scheduling integration confirms it.
 - When discussing due or overdue deal follow-ups, compare next_action_due with the current date and clearly distinguish due today, upcoming, and overdue items.
+
+- Commercial follow-up action queue is derived read-only context from saved active deals; reading, sorting, or summarizing it must not create or update deals or events.
+- For action-queue requests, present OVERDUE first, then DUE_TODAY, then UPCOMING, then UNSCHEDULED. UNKNOWN_DUE should be called out separately as a saved date that could not be interpreted.
+- A deal with no next_action_due is UNSCHEDULED, not overdue. Do not invent a due date.
+- Preserve each saved deal's supplier, status, waiting_on, next_action, and next_action_due. Do not infer that a supplier missed a deadline unless the saved due date is actually in the past.
+- When useful, explain urgency from the derived timing, but do not change priority, status, or next action unless the user explicitly requests an update and the persistence layer confirms it.
 """
 
 research_agent = Agent(

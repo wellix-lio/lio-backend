@@ -1672,12 +1672,91 @@ async def _commercial_comparison_context(user_id: str, message: str) -> str:
     return "\n".join(lines)
 
 
+
+def _commercial_followup_action_queue_items(deals):
+    """Build a deterministic read-only queue from saved active deals."""
+    today = _deal_followup_today()
+    items = []
+
+    for deal in deals or []:
+        raw_due = deal.get("next_action_due")
+        due = None
+        bucket = "UNSCHEDULED"
+        timing = "no follow-up date saved"
+        rank = 3
+
+        if raw_due:
+            try:
+                due = datetime.strptime(str(raw_due)[:10], "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                bucket = "UNKNOWN_DUE"
+                timing = f"unreadable saved due date={raw_due}"
+                rank = 4
+            else:
+                delta = (due - today).days
+                if delta < 0:
+                    bucket = "OVERDUE"
+                    timing = f"{abs(delta)} day(s) overdue"
+                    rank = 0
+                elif delta == 0:
+                    bucket = "DUE_TODAY"
+                    timing = "due today"
+                    rank = 1
+                else:
+                    bucket = "UPCOMING"
+                    timing = f"due in {delta} day(s)"
+                    rank = 2
+
+        items.append({
+            "rank": rank,
+            "bucket": bucket,
+            "due": due,
+            "timing": timing,
+            "deal": deal,
+        })
+
+    items.sort(key=lambda item: (
+        item["rank"],
+        item["due"].isoformat() if item["due"] else "9999-12-31",
+        int(item["deal"].get("id") or 0),
+    ))
+    return items
+
+
+def _commercial_followup_action_queue_context(deals) -> str:
+    items = _commercial_followup_action_queue_items(deals)
+    if not items:
+        return ""
+
+    lines = [
+        "Commercial follow-up action queue (read-only; derived from saved active deals):"
+    ]
+
+    for item in items:
+        deal = item["deal"]
+        details = [
+            f"priority={item['bucket']}",
+            f"deal_id={deal.get('id')}",
+            f"supplier={deal.get('supplier')}" if deal.get("supplier") else None,
+            f"product={deal.get('product')}" if deal.get("product") else None,
+            f"status={deal.get('status')}" if deal.get("status") else None,
+            f"waiting_on={deal.get('waiting_on')}" if deal.get("waiting_on") else None,
+            f"next_action={deal.get('next_action')}" if deal.get("next_action") else None,
+            f"next_action_due={deal.get('next_action_due')}" if deal.get("next_action_due") else None,
+            f"timing={item['timing']}",
+        ]
+        lines.append("- " + "; ".join(x for x in details if x))
+
+    return "\n".join(lines)
+
+
 async def _persistent_context(user_id: str) -> str:
     profile = await get_profile(user_id)
     memories = await saved_memories(user_id, 20)
     smart = await get_smart_memories(user_id, 30)
     commercial = await get_commercial_memory(user_id, supplier_limit=10, offer_limit=20)
     deals = await get_commercial_deals(user_id, active_only=True, limit=30)
+    followup_queue_context = _commercial_followup_action_queue_context(deals)
     supplier_ids = [item["id"] for item in commercial.get("suppliers", [])]
     commercial_languages = await get_commercial_supplier_languages(user_id, supplier_ids)
 
@@ -1700,6 +1779,9 @@ async def _persistent_context(user_id: str) -> str:
 
     suppliers = commercial.get("suppliers", [])
     offers = commercial.get("offers", [])
+
+    if followup_queue_context:
+        lines.extend(followup_queue_context.splitlines())
 
     if deals:
         lines.append("Active commercial deal tracking:")
