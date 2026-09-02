@@ -373,6 +373,21 @@ def _extract_commercial_record(message: str):
 
             if supplier.casefold() in legal_name.casefold():
                 supplier = legal_name
+    # Prefer a clearly labelled legal company name when the message also
+    # contains meta-instructions such as "analyze this supplier offer".
+    # The company-body pattern deliberately excludes sentence-ending dots,
+    # so a meta phrase cannot swallow a later real company name.
+    labelled_legal_supplier_matches = list(re.finditer(
+        r"\b(?:supplier|factory|vendor|company|lieferant|fabrik|firma)\s+("
+        r"(?:[A-Za-z0-9&'()+\-]+\s+){0,12}"
+        r"(?:Co\.\s*,?\s*Ltd\.?|Ltd\.?|Limited|LLC|Inc\.?|Corporation|Corp\.?|GmbH|AG)"
+        r")",
+        message,
+        flags=re.IGNORECASE,
+    ))
+    if labelled_legal_supplier_matches:
+        supplier = labelled_legal_supplier_matches[-1].group(1).strip(" \t-,:;")
+
     if not supplier:
         return None
 
@@ -390,6 +405,15 @@ def _extract_commercial_record(message: str):
         flags=re.IGNORECASE,
     )
     thickness_mm = _commercial_number(thickness_match.group(1)) if thickness_match else None
+    if thickness_mm is None:
+        value_first_thickness_match = re.search(
+            r"([0-9٠-٩۰-۹]+(?:[.,][0-9٠-٩۰-۹]+)?)\s*mm\s*"
+            r"(?:thickness|thick|stärke|staerke|سماكة|السماكة)",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if value_first_thickness_match:
+            thickness_mm = _commercial_number(value_first_thickness_match.group(1))
 
     product = _first_match(
         message,
@@ -436,6 +460,19 @@ def _extract_commercial_record(message: str):
     )
     price = _commercial_number(price_match.group(1)) if price_match else None
     currency_raw = price_match.group(2) if price_match and price_match.group(2) else None
+
+    if price is None:
+        currency_first_price_match = re.search(
+            r"(?:\bat\b|\bprice\s*[:=]?\s*)?"
+            r"(USD|US\$|\$|EUR|€|CNY|RMB|دولار(?:\s+أمريكي)?|يورو|يوان)\s*"
+            r"([0-9٠-٩۰-۹]+(?:[.,][0-9٠-٩۰-۹]+)?)"
+            r"(?=\s*(?:/|per\b|pro\b|للمتر|لكل|m2\b|m²\b|sqm\b|piece\b|pc\b|قطعة\b|[,;.]|$))",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if currency_first_price_match:
+            currency_raw = currency_first_price_match.group(1)
+            price = _commercial_number(currency_first_price_match.group(2))
 
     if not currency_raw:
         currency_search = re.search(
@@ -487,6 +524,29 @@ def _extract_commercial_record(message: str):
         ],
     )
 
+    if payment_terms:
+        payment_terms = re.split(
+            r"\.\s+(?=(?:lead\s*time|delivery\s*time|valid(?:ity)?|quote\s+valid|"
+            r"packing|port|origin|مدة\s+التجهيز|مدة\s+التسليم|صلاحية|التعبئة|"
+            r"lieferzeit|gültig|gueltig)\b)",
+            payment_terms,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+
+    lead_time_days = None
+    lead_time_match = re.search(
+        r"(?:lead\s*time|production\s+lead\s*time|delivery\s*time|"
+        r"مدة\s+التجهيز|مدة\s+التسليم|lieferzeit)\s*[:=]?\s*"
+        r"([0-9٠-٩۰-۹]+)\s*(?:days?|يوم|يوماً|يوما|tage?n?)\b",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if lead_time_match:
+        lead_time_value = _commercial_number(lead_time_match.group(1))
+        if lead_time_value is not None:
+            lead_time_days = int(lead_time_value)
+
     date_match = re.search(
         r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b|\b(\d{1,2})[./](\d{1,2})[./](20\d{2})\b",
         message,
@@ -497,6 +557,37 @@ def _extract_commercial_record(message: str):
             quote_date = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
         else:
             quote_date = f"{int(date_match.group(6)):04d}-{int(date_match.group(5)):02d}-{int(date_match.group(4)):02d}"
+
+    valid_until = None
+    valid_until_match = re.search(
+        r"(?:valid\s+until|quote\s+valid\s+until|validity\s+until|"
+        r"صالح\s+حتى|صالح\s+لغاية|صلاحية\s+العرض\s+حتى|"
+        r"gültig\s+bis|gueltig\s+bis)\s*[:=]?\s*"
+        r"((?:20\d{2})[-/.]\d{1,2}[-/.]\d{1,2}|"
+        r"\d{1,2}[./]\d{1,2}[./](?:20\d{2}))",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if valid_until_match:
+        raw_valid_until = valid_until_match.group(1)
+        valid_date_match = re.match(
+            r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})|"
+            r"(\d{1,2})[./](\d{1,2})[./](20\d{2})",
+            raw_valid_until,
+        )
+        if valid_date_match:
+            if valid_date_match.group(1):
+                valid_until = (
+                    f"{int(valid_date_match.group(1)):04d}-"
+                    f"{int(valid_date_match.group(2)):02d}-"
+                    f"{int(valid_date_match.group(3)):02d}"
+                )
+            else:
+                valid_until = (
+                    f"{int(valid_date_match.group(6)):04d}-"
+                    f"{int(valid_date_match.group(5)):02d}-"
+                    f"{int(valid_date_match.group(4)):02d}"
+                )
 
     languages = []
     language_map = [
@@ -566,6 +657,16 @@ def _extract_commercial_record(message: str):
                 flags=re.IGNORECASE,
             ).strip(" \t-،,.;")
 
+    if city:
+        city_folded = city.casefold().strip()
+        bad_city_tokens = (
+            "missing", "information", "shipment", "payment", "offer", "quote",
+            "supplier", "product", "price", "terms", "lead time", "delivery",
+            "analysis", "facts", "details",
+        )
+        if any(token in city_folded for token in bad_city_tokens) or len(city.split()) > 4:
+            city = None
+
     if city and country and city.casefold() in {
         "الصين", "china", "تركيا", "turkey", "türkei", "tuerkei",
         "إسبانيا", "اسبانيا", "spain", "spanien",
@@ -591,6 +692,8 @@ def _extract_commercial_record(message: str):
         "incoterm": incoterm,
         "payment_terms": payment_terms,
         "quote_date": quote_date,
+        "valid_until": valid_until,
+        "lead_time_days": lead_time_days,
         "languages": languages,
     }
 
@@ -675,6 +778,8 @@ async def _capture_commercial_memory(user_id: str, message: str):
             record["incoterm"] is not None,
             record["payment_terms"] is not None,
             record["quote_date"] is not None,
+            record["valid_until"] is not None,
+            record["lead_time_days"] is not None,
         )
     )
     offer_id = None
@@ -691,6 +796,8 @@ async def _capture_commercial_memory(user_id: str, message: str):
             incoterm=record["incoterm"],
             payment_terms=record["payment_terms"],
             quote_date=record["quote_date"],
+            valid_until=record["valid_until"],
+            lead_time_days=record["lead_time_days"],
             source="user_message",
         )
 
