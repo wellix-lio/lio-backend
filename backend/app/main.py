@@ -330,6 +330,20 @@ def _extract_commercial_record(message: str):
         ],
     )
     supplier = _clean_commercial_supplier_name(supplier)
+
+    # Preserve common legal company suffixes such as "Co., Ltd." that may contain commas.
+    if supplier:
+        legal_name_match = re.search(
+            r"([A-Z][A-Za-z0-9&'().,\- ]{1,150}?"
+            r"(?:Co\.\s*,?\s*Ltd\.?|Ltd\.?|Limited|Inc\.?|LLC|L\.L\.C\.|"
+            r"Corp\.?|Corporation|GmbH|AG|S\.A\.|S\.L\.|B\.V\.|Pte\.?\s+Ltd\.?))",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if legal_name_match:
+            legal_name = legal_name_match.group(1).strip(" \t-,:;")
+            if supplier.casefold() in legal_name.casefold():
+                supplier = legal_name
     if not supplier:
         return None
 
@@ -470,6 +484,19 @@ def _extract_commercial_record(message: str):
         if re.search(pattern, message, flags=re.IGNORECASE):
             languages.append(normalized)
 
+    website = None
+    website_match = re.search(
+        r"(?<![@\w])("
+        r"(?:https?://)?(?:www\.)?"
+        r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,62}\.)+[A-Za-z]{2,}"
+        r"(?:/[^\s،,;]*)?"
+        r")",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if website_match:
+        website = website_match.group(1).rstrip(".,;،")
+
     country = None
     country_map = [
         (r"(?:\bchina\b|الصين)", "China"),
@@ -493,6 +520,23 @@ def _extract_commercial_record(message: str):
             r"\b(?:aus|in)\s+([A-Za-zÀ-ÿ' -]{2,60}?)(?=\s+(?:in|china|türkei|spanien|bietet|bot|preis)\b|[,.;]|$)",
         ],
     )
+    if city and country:
+        country_suffixes = {
+            "China": ("China", "الصين"),
+            "Turkey": ("Turkey", "Türkiye", "تركيا"),
+            "Spain": ("Spain", "إسبانيا", "اسبانيا"),
+            "Austria": ("Austria", "Österreich", "النمسا"),
+            "Italy": ("Italy", "إيطاليا", "ايطاليا"),
+            "India": ("India", "الهند"),
+        }
+        for country_token in country_suffixes.get(country, ()):
+            city = re.sub(
+                rf"(?:\s+|,\s*){re.escape(country_token)}\s*$",
+                "",
+                city,
+                flags=re.IGNORECASE,
+            ).strip(" \t-،,.;")
+
     if city and country and city.casefold() in {
         "الصين", "china", "تركيا", "turkey", "türkei", "tuerkei",
         "إسبانيا", "اسبانيا", "spain", "spanien",
@@ -506,6 +550,7 @@ def _extract_commercial_record(message: str):
         "supplier": supplier,
         "country": country,
         "city": city,
+        "website": website,
         "product": product,
         "size": size,
         "thickness_mm": thickness_mm,
@@ -531,6 +576,7 @@ async def _capture_commercial_memory(user_id: str, message: str):
         record["supplier"],
         country=record["country"],
         city=record["city"],
+        website=record["website"],
     )
 
     for language in record.get("languages", []):
