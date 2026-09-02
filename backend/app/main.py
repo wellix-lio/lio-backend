@@ -1,4 +1,6 @@
 import re
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import Response
@@ -35,6 +37,7 @@ from .memory import (
     get_commercial_memory,
     create_commercial_deal,
     get_commercial_deals,
+    get_commercial_deal_by_id,
     update_commercial_deal,
 )
 
@@ -1213,6 +1216,232 @@ def _extract_deal_tracking_status(message: str):
     return None
 
 
+
+def _deal_followup_today():
+    # Prefer the user's business timezone; fall back safely if tzdata is unavailable.
+    try:
+        return datetime.now(ZoneInfo("Europe/Vienna")).date()
+    except Exception:
+        return datetime.now(timezone.utc).date()
+
+
+def _deal_followup_ascii_digits(value: str) -> str:
+    return (value or "").translate(str.maketrans(
+        "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+        "01234567890123456789",
+    ))
+
+
+_DEAL_FOLLOWUP_MONTHS = {
+    # Arabic
+    "يناير": 1, "كانون الثاني": 1,
+    "فبراير": 2, "شباط": 2,
+    "مارس": 3, "آذار": 3, "اذار": 3,
+    "أبريل": 4, "ابريل": 4, "نيسان": 4,
+    "مايو": 5, "أيار": 5, "ايار": 5,
+    "يونيو": 6, "حزيران": 6,
+    "يوليو": 7, "تموز": 7,
+    "أغسطس": 8, "اغسطس": 8, "آب": 8, "اب": 8,
+    "سبتمبر": 9, "أيلول": 9, "ايلول": 9,
+    "أكتوبر": 10, "اكتوبر": 10, "تشرين الأول": 10, "تشرين الاول": 10,
+    "نوفمبر": 11, "تشرين الثاني": 11,
+    "ديسمبر": 12, "كانون الأول": 12, "كانون الاول": 12,
+    # English
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+    # German
+    "januar": 1,
+    "februar": 2,
+    "märz": 3, "maerz": 3,
+    "april": 4,
+    "mai": 5,
+    "juni": 6,
+    "juli": 7,
+    "august": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "dezember": 12,
+}
+
+
+def _deal_followup_build_date(year: int, month: int, day: int):
+    try:
+        return datetime(int(year), int(month), int(day)).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_deal_followup_date(message: str):
+    raw = _deal_followup_ascii_digits(message)
+    folded = raw.casefold()
+    today = _deal_followup_today()
+
+    if re.search(r"(?:\bغد(?:اً|ًا|ا)?\b|\btomorrow\b|\bmorgen\b)", folded):
+        return today + timedelta(days=1)
+
+    relative_patterns = (
+        r"بعد\s+(\d{1,4})\s*(?:يوم|يوماً|يومًا|ايام|أيام)",
+        r"\bin\s+(\d{1,4})\s+days?\b",
+        r"\bafter\s+(\d{1,4})\s+days?\b",
+        r"\bin\s+(\d{1,4})\s+tagen?\b",
+        r"\bnach\s+(\d{1,4})\s+tagen?\b",
+    )
+    for pattern in relative_patterns:
+        m = re.search(pattern, folded, flags=re.IGNORECASE)
+        if m:
+            days = int(m.group(1))
+            if 0 <= days <= 3650:
+                return today + timedelta(days=days)
+
+    m = re.search(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", folded)
+    if m:
+        return _deal_followup_build_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    m = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b", folded)
+    if m:
+        return _deal_followup_build_date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+
+    month_names = sorted(_DEAL_FOLLOWUP_MONTHS, key=len, reverse=True)
+    month_alt = "|".join(re.escape(x) for x in month_names)
+    m = re.search(
+        rf"(?<!\d)(\d{{1,2}})\.?\s+({month_alt})(?:\s+(20\d{{2}}))?",
+        folded,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        day = int(m.group(1))
+        month = _DEAL_FOLLOWUP_MONTHS.get(m.group(2).casefold())
+        year = int(m.group(3)) if m.group(3) else today.year
+        candidate = _deal_followup_build_date(year, month, day)
+        if candidate and not m.group(3) and candidate < today:
+            candidate = _deal_followup_build_date(year + 1, month, day)
+        return candidate
+
+    return None
+
+
+def _is_deal_followup_due_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "تابع", "متابعة", "المتابعة", "ذكّرني", "ذكرني", "موعد متابعة",
+        "follow up", "follow-up", "followup", "remind me", "check back", "due date",
+        "nachfassen", "nachverfolgen", "erinner", "wiedervorlage",
+    )
+    return any(signal in folded for signal in signals)
+
+
+def _extract_deal_followup_supplier_query(message: str):
+    patterns = (
+        r"(?:المورد|مع\s+المورد|مع)\s+(.+?)(?=\s+(?:بعد|في|بتاريخ|يوم)\b|[.،,!؟?]*$)",
+        r"\bsupplier\s+(.+?)(?=\s+(?:in|after|on)\b|[.!?]*$)",
+        r"\bwith\s+(.+?)(?=\s+(?:in|after|on)\b|[.!?]*$)",
+        r"\blieferant(?:en)?\s+(.+?)(?=\s+(?:in|nach|am)\b|[.!?]*$)",
+        r"\bmit\s+(.+?)(?=\s+(?:in|nach|am)\b|[.!?]*$)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, message, flags=re.IGNORECASE)
+        if m:
+            value = _clean_value(m.group(1))
+            if value and value.casefold() not in {
+                "هذا", "هذه", "هالمورد", "the supplier", "this supplier",
+                "diesem lieferanten", "dem lieferanten",
+            }:
+                return value
+    return None
+
+
+def _extract_deal_followup_request(message: str):
+    if not _is_deal_followup_due_request(message):
+        return None
+
+    due_date = _extract_deal_followup_date(message)
+    if not due_date:
+        return None
+
+    id_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        _deal_followup_ascii_digits(message),
+        flags=re.IGNORECASE,
+    )
+    return {
+        "deal_id": int(id_match.group(1)) if id_match else None,
+        "supplier_query": _extract_deal_followup_supplier_query(message),
+        "next_action_due": due_date.isoformat(),
+    }
+
+
+async def _capture_deal_followup_due(user_id: str, message: str):
+    request = _extract_deal_followup_request(message)
+    if not request:
+        return None
+
+    deal = None
+
+    if request["deal_id"] is not None:
+        deal = await get_commercial_deal_by_id(user_id, request["deal_id"])
+        if not deal:
+            return "Deal follow-up date not saved: deal #%s was not found." % request["deal_id"]
+        if not deal.get("is_active"):
+            return "Deal follow-up date not saved: deal #%s is not active." % request["deal_id"]
+
+    elif request["supplier_query"]:
+        supplier, error = await _resolve_management_supplier(user_id, request["supplier_query"])
+        if error:
+            return error.replace("Commercial management", "Deal follow-up")
+        deals = await get_commercial_deals(
+            user_id,
+            active_only=True,
+            supplier_id=supplier["id"],
+            limit=10,
+        )
+        if not deals:
+            return "Deal follow-up date not saved: no active deal exists for supplier %s." % supplier["name"]
+        if len(deals) > 1:
+            return (
+                "Deal follow-up date not saved: multiple active deals exist for "
+                "supplier %s; specify the deal ID." % supplier["name"]
+            )
+        deal = deals[0]
+
+    else:
+        deals = await get_commercial_deals(user_id, active_only=True, limit=20)
+        if not deals:
+            return "Deal follow-up date not saved: there is no active deal."
+        if len(deals) > 1:
+            return (
+                "Deal follow-up date not saved: multiple active deals exist; "
+                "specify the deal ID or supplier."
+            )
+        deal = deals[0]
+
+    changed = await update_commercial_deal(
+        user_id,
+        deal["id"],
+        next_action_due=request["next_action_due"],
+    )
+    if not changed:
+        return "Deal follow-up date not saved: deal update failed."
+
+    return (
+        f"Deal follow-up due date saved: deal_id={deal['id']}; "
+        f"supplier={deal.get('supplier')}; "
+        f"next_action_due={request['next_action_due']}. "
+        "This records an internal deal-tracking due date; "
+        "it does not schedule an external notification."
+    )
+
+
 async def _capture_deal_tracking(user_id: str, message: str):
     command = _extract_deal_tracking_status(message)
     if not command:
@@ -1289,6 +1518,10 @@ async def _capture_user_memory(user_id: str, message: str):
     management_action = await _capture_commercial_management(user_id, message)
     if management_action:
         return management_action
+
+    followup_due_action = await _capture_deal_followup_due(user_id, message)
+    if followup_due_action:
+        return followup_due_action
 
     deal_action = await _capture_deal_tracking(user_id, message)
     if deal_action:
