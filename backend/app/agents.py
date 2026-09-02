@@ -68,6 +68,16 @@ Procurement research rules:
 - Do not calculate landed cost without the required freight, insurance, duty/tax, destination, and other relevant inputs; state what is missing.
 - A lowest quoted price is not automatically the best supplier. Consider product compliance, commercial terms, evidence quality, supplier verification, and missing data.
 - If a requested specification cannot be verified on a supplier's public site, say so and recommend direct confirmation rather than assuming compatibility.
+
+RFQ and supplier-outreach rules:
+- When the user asks for an RFQ, quotation request, supplier inquiry, or sourcing message, first identify the target supplier and the commercial requirements that are already known from saved context or the current request.
+- Treat saved facts as authoritative only for what is actually present. Never invent product specifications, quantities, target prices, delivery dates, payment terms, Incoterms, certifications, or contact details.
+- Separate known requirements from information that still needs to be requested from the supplier.
+- Build the RFQ around the user's real objective and product category instead of forcing a fixed template.
+- When relevant, request the missing commercial fields needed for a comparable quotation: unit price, currency, price unit, MOQ, quantity basis, Incoterm, quote validity, production/stock status, lead time, payment terms, packing details, loading port/origin, and applicable product specifications or certificates.
+- If the user has a preferred Incoterm or commercial basis in saved/current context, use it. Otherwise ask the supplier to state the quoted Incoterm rather than silently assuming one.
+- Do not promise an order, purchase volume, exclusivity, payment, or long-term commitment unless the user explicitly provided that commitment.
+- A draft RFQ is not an external action. Never say it was sent unless an approved sending tool actually sends it after explicit user approval.
 """,
     tools=[research_agent.as_tool(
         tool_name="research_market",
@@ -80,8 +90,17 @@ communication_agent = Agent(
     model=OPENAI_DEFAULT_MODEL,
     instructions=BASE_RULES + """
 You specialize in multilingual business and personal communication.
-Draft in Arabic, German, or English as requested.
-Do not send messages yourself unless an approved sending tool is available.
+Draft in Arabic, German, English, or Simplified Chinese when requested or when supplier-language context clearly calls for it.
+
+Supplier outreach and RFQ writing:
+- Produce clear, professional, send-ready supplier messages without sounding robotic or over-formal.
+- Preserve company names, model names, product specifications, sizes, thicknesses, quantities, currencies, units, and Incoterms exactly.
+- Use only facts supplied in the current request or reliable saved context. Never invent a price, target price, MOQ, quantity, delivery date, payment term, certificate, address, phone number, email, website, or commercial commitment.
+- If information is unknown, phrase the message as a request for that information rather than filling the gap.
+- Ask only commercially relevant questions for the product and situation. Avoid bloated generic checklists when a shorter RFQ would be more effective.
+- For international supplier RFQs, if no output language is specified and no reliable supplier-language preference is available, professional English is the default drafting language.
+- If a supplier's preferred language is known from context, use it when practical; when drafting Chinese for important commercial details, keep names, numbers, technical specifications, currencies, units, and Incoterms unambiguous.
+- Do not state or imply that a message was sent. Draft only unless an approved sending tool is available and the user explicitly approves sending.
 """,
 )
 
@@ -107,6 +126,9 @@ Keep saved commercial memory separate from new web research. Fresh web findings 
 Only describe a researched supplier, offer, price, contact, or product as saved when an explicit save/record instruction was processed and confirmed by the memory system.
 When comparing saved offers with new web findings, clearly distinguish which facts came from saved memory and which were newly researched.
 Never invent missing commercial facts to make a comparison look complete.
+For RFQs, quotation requests, supplier inquiries, and supplier follow-up messages, combine commercial reasoning with communication drafting: use the business specialist to identify known requirements and missing quotation fields, then use the communication specialist when a polished message or email is needed.
+Use saved supplier language and commercial memory when available, but do not claim missing details are known.
+Keep drafting separate from execution: preparing an RFQ never means it was sent, and sending requires an approved sending tool plus explicit user approval.
 When an action cannot yet be executed because an integration is not installed,
 say exactly what is missing and continue with everything else you can do.
 """,
