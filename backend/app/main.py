@@ -1503,15 +1503,24 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
         deal = deals[0]
 
     # A supplier reply ends the old "follow up if no reply" waiting period.
-    changed = await update_commercial_deal(
-        user_id,
-        deal["id"],
-        waiting_on="user",
-        next_action="Review supplier response and reply",
-        clear_next_action_due=bool(deal.get("next_action_due")),
+    # If the deal is already in the correct handoff state, that is not a failure:
+    # continue so the reply event and any explicit commercial save can still run.
+    handoff_state_changed = (
+        deal.get("waiting_on") != "user"
+        or deal.get("next_action") != "Review supplier response and reply"
+        or deal.get("next_action_due") is not None
     )
-    if not changed:
-        return "Supplier reply handoff not recorded: deal update failed."
+
+    if handoff_state_changed:
+        changed = await update_commercial_deal(
+            user_id,
+            deal["id"],
+            waiting_on="user",
+            next_action="Review supplier response and reply",
+            clear_next_action_due=bool(deal.get("next_action_due")),
+        )
+        if not changed:
+            return "Supplier reply handoff not recorded: deal update failed."
 
     await add_commercial_deal_event(
         user_id,
