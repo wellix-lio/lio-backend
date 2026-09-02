@@ -37,6 +37,7 @@ from .memory import (
     get_commercial_memory,
     create_commercial_deal,
     get_commercial_deals,
+    add_commercial_deal_event,
     get_commercial_deal_by_id,
     update_commercial_deal,
 )
@@ -1381,6 +1382,246 @@ def _extract_deal_followup_request(message: str):
     }
 
 
+
+def _is_deal_followup_outcome_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        # Arabic
+        "أرسلت المتابعة", "ارسلت المتابعة", "تم إرسال المتابعة", "تم ارسال المتابعة",
+        "أرسلت رسالة متابعة", "ارسلت رسالة متابعة", "تابعت مع المورد",
+        "بانتظار المورد", "ننتظر المورد", "انتظار المورد",
+        "المورد طلب", "طلب المورد", "المورد رد", "رد المورد", "وصل رد المورد",
+        "المورد ينتظرنا", "بانتظارنا",
+        # English
+        "sent the follow-up", "sent a follow-up", "follow-up sent", "follow up sent",
+        "followed up with", "waiting for the supplier", "waiting on the supplier",
+        "awaiting the supplier", "supplier asked for", "supplier requested",
+        "supplier replied", "supplier responded", "received the supplier reply",
+        "supplier is waiting for us", "waiting on us", "we need to reply",
+        # German
+        "nachfassnachricht gesendet", "nachricht nachgefasst", "nachgefasst bei",
+        "warten auf den lieferanten", "warte auf den lieferanten",
+        "lieferant hat um", "lieferant bat um", "lieferant hat geantwortet",
+        "antwort vom lieferanten erhalten", "lieferant wartet auf uns",
+        "wir müssen antworten", "wir muessen antworten",
+    )
+    return any(signal in folded for signal in signals)
+
+
+def _extract_deal_followup_outcome_supplier_query(message: str):
+    patterns = (
+        r"\bwith\s+(?:supplier\s+)?(.+?)(?=[,;.]\s*|\s+(?:and|then|who|which)\b|$)",
+        r"\bfor\s+supplier\s+(.+?)(?=[,;.]\s*|\s+(?:and|then|who|which)\b|$)",
+        r"\bmit\s+(?:dem\s+)?lieferanten\s+(.+?)(?=[,;.]\s*|\s+(?:und|dann|der|die)\b|$)",
+        r"(?:مع\s+المورد|مع)\s+(.+?)(?=[،,;.]\s*|\s+(?:ثم|وهو|والذي|و)\b|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message or "", flags=re.IGNORECASE)
+        if match:
+            value = _clean_value(match.group(1))
+            if value and value.casefold() not in {
+                "the supplier", "supplier", "المورد", "هذا المورد",
+                "dem lieferanten", "lieferant",
+            }:
+                return value
+    return None
+
+
+def _extract_deal_followup_outcome_request(message: str):
+    if not _is_deal_followup_outcome_request(message):
+        return None
+
+    folded = (message or "").casefold()
+    ascii_message = _deal_followup_ascii_digits(message or "")
+    id_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        ascii_message,
+        flags=re.IGNORECASE,
+    )
+
+    due = _extract_deal_followup_date(message)
+
+    sent = any(x in folded for x in (
+        "أرسلت المتابعة", "ارسلت المتابعة", "تم إرسال المتابعة", "تم ارسال المتابعة",
+        "أرسلت رسالة متابعة", "ارسلت رسالة متابعة", "تابعت مع المورد",
+        "sent the follow-up", "sent a follow-up", "follow-up sent", "follow up sent",
+        "followed up with", "nachfassnachricht gesendet", "nachricht nachgefasst",
+        "nachgefasst bei",
+    ))
+
+    waiting_supplier = any(x in folded for x in (
+        "بانتظار المورد", "ننتظر المورد", "انتظار المورد",
+        "waiting for the supplier", "waiting on the supplier", "awaiting the supplier",
+        "warten auf den lieferanten", "warte auf den lieferanten",
+    ))
+
+    waiting_user = any(x in folded for x in (
+        "المورد ينتظرنا", "بانتظارنا",
+        "supplier is waiting for us", "waiting on us", "we need to reply",
+        "lieferant wartet auf uns", "wir müssen antworten", "wir muessen antworten",
+    ))
+
+    supplier_replied = any(x in folded for x in (
+        "المورد رد", "رد المورد", "وصل رد المورد",
+        "supplier replied", "supplier responded", "received the supplier reply",
+        "lieferant hat geantwortet", "antwort vom lieferanten erhalten",
+    ))
+
+    supplier_requested_time = any(x in folded for x in (
+        "المورد طلب", "طلب المورد",
+        "supplier asked for", "supplier requested",
+        "lieferant hat um", "lieferant bat um",
+    ))
+
+    waiting_on = None
+    if waiting_user:
+        waiting_on = "user"
+    elif waiting_supplier or sent or supplier_requested_time:
+        waiting_on = "supplier"
+    elif supplier_replied:
+        waiting_on = "user"
+
+    next_action = None
+    if waiting_user or supplier_replied:
+        next_action = "Review supplier response and reply"
+    elif due and (sent or waiting_supplier or supplier_requested_time):
+        next_action = "Follow up with supplier if no reply"
+    elif sent or waiting_supplier:
+        next_action = "Wait for supplier reply"
+
+    if sent:
+        event_type = "followup_sent"
+    elif supplier_requested_time:
+        event_type = "supplier_requested_time"
+    elif supplier_replied:
+        event_type = "supplier_reply_received"
+    elif waiting_supplier:
+        event_type = "waiting_supplier"
+    elif waiting_user:
+        event_type = "waiting_user"
+    elif due:
+        event_type = "followup_rescheduled"
+    else:
+        event_type = "followup_outcome"
+
+    cleaned = " ".join((message or "").strip().split())
+    if len(cleaned) > 500:
+        cleaned = cleaned[:497] + "..."
+
+    return {
+        "deal_id": int(id_match.group(1)) if id_match else None,
+        "supplier_query": _extract_deal_followup_outcome_supplier_query(message),
+        "next_action_due": due.isoformat() if due else None,
+        "waiting_on": waiting_on,
+        "next_action": next_action,
+        "event_type": event_type,
+        "event_summary": f"User-stated follow-up outcome: {cleaned}",
+    }
+
+
+async def _capture_deal_followup_outcome(user_id: str, message: str):
+    request = _extract_deal_followup_outcome_request(message)
+    if not request:
+        return None
+
+    deal = None
+
+    if request["deal_id"] is not None:
+        deal = await get_commercial_deal_by_id(user_id, request["deal_id"])
+        if not deal:
+            return "Follow-up outcome not recorded: deal #%s was not found." % request["deal_id"]
+        if not deal.get("is_active"):
+            return "Follow-up outcome not recorded: deal #%s is not active." % request["deal_id"]
+
+    elif request["supplier_query"]:
+        supplier, error = await _resolve_management_supplier(
+            user_id, request["supplier_query"]
+        )
+        if error:
+            return error.replace("Commercial management", "Follow-up outcome")
+
+        deals = await get_commercial_deals(
+            user_id,
+            active_only=True,
+            supplier_id=supplier["id"],
+            limit=10,
+        )
+        if not deals:
+            return (
+                "Follow-up outcome not recorded: no active deal exists for supplier "
+                f"{supplier['name']}."
+            )
+        if len(deals) > 1:
+            return (
+                "Follow-up outcome not recorded: multiple active deals exist for supplier "
+                f"{supplier['name']}; specify the deal ID."
+            )
+        deal = deals[0]
+
+    else:
+        deals = await get_commercial_deals(user_id, active_only=True, limit=20)
+        if not deals:
+            return "Follow-up outcome not recorded: there is no active deal."
+        if len(deals) > 1:
+            return (
+                "Follow-up outcome not recorded: multiple active deals exist; "
+                "specify the deal ID or supplier."
+            )
+        deal = deals[0]
+
+    changes = {}
+
+    if (
+        request["waiting_on"] is not None
+        and request["waiting_on"] != deal.get("waiting_on")
+    ):
+        changes["waiting_on"] = request["waiting_on"]
+
+    if (
+        request["next_action"] is not None
+        and request["next_action"] != deal.get("next_action")
+    ):
+        changes["next_action"] = request["next_action"]
+
+    if (
+        request["next_action_due"] is not None
+        and request["next_action_due"] != deal.get("next_action_due")
+    ):
+        changes["next_action_due"] = request["next_action_due"]
+
+    if changes:
+        changed = await update_commercial_deal(
+            user_id,
+            deal["id"],
+            waiting_on=changes.get("waiting_on"),
+            next_action=changes.get("next_action"),
+            next_action_due=changes.get("next_action_due"),
+        )
+        if not changed:
+            return "Follow-up outcome not recorded: deal update failed."
+
+    await add_commercial_deal_event(
+        user_id,
+        deal["id"],
+        request["event_type"],
+        request["event_summary"],
+        source="user",
+    )
+
+    saved_parts = [f"event={request['event_type']}"]
+    for key in ("waiting_on", "next_action", "next_action_due"):
+        if key in changes:
+            saved_parts.append(f"{key}={changes[key]}")
+
+    return (
+        f"Follow-up outcome recorded: deal_id={deal['id']}; "
+        f"supplier={deal.get('supplier')}; "
+        + "; ".join(saved_parts)
+        + ". No new deal was created. "
+        "A saved next_action_due is internal deal tracking only; it does not schedule an external notification."
+    )
+
+
 async def _capture_deal_followup_due(user_id: str, message: str):
     request = _extract_deal_followup_request(message)
     if not request:
@@ -1518,6 +1759,10 @@ async def _capture_user_memory(user_id: str, message: str):
     management_action = await _capture_commercial_management(user_id, message)
     if management_action:
         return management_action
+
+    followup_outcome_action = await _capture_deal_followup_outcome(user_id, message)
+    if followup_outcome_action:
+        return followup_outcome_action
 
     followup_due_action = await _capture_deal_followup_due(user_id, message)
     if followup_due_action:

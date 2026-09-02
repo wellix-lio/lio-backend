@@ -47,6 +47,12 @@ Commercial deal follow-up clarity:
 - A deal with no next_action_due is UNSCHEDULED, not overdue. Do not invent a due date.
 - Preserve each saved deal's supplier, status, waiting_on, next_action, and next_action_due. Do not infer that a supplier missed a deadline unless the saved due date is actually in the past.
 - When useful, explain urgency from the derived timing, but do not change priority, status, or next action unless the user explicitly requests an update and the persistence layer confirms it.
+
+- Follow-up outcomes are user-stated tracking history unless the persistent context independently shows the supplier stated the same fact. Do not convert a user's action note into a supplier-stated commercial fact.
+- A recorded follow-up outcome may update waiting_on, next_action, or next_action_due, but it must not silently invent or change price, MOQ, payment terms, lead time, offer facts, or other commercial terms.
+- Recording that the user sent a follow-up means the system recorded the user's statement; it does not mean Lio itself sent the message.
+- Outcome/rescheduling updates must target an existing active deal. Never imply a new deal was created from a follow-up outcome unless persistence explicitly confirms creation.
+- If multiple active deals could match an outcome and the user did not identify one, require deal ID or supplier instead of guessing.
 """
 
 SUPPLIER_FOLLOWUP_DRAFTING_RULES = """
