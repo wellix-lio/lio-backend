@@ -101,6 +101,9 @@ Supplier outreach and RFQ writing:
 - For international supplier RFQs, if no output language is specified and no reliable supplier-language preference is available, professional English is the default drafting language.
 - If a supplier's preferred language is known from context, use it when practical; when drafting Chinese for important commercial details, keep names, numbers, technical specifications, currencies, units, and Incoterms unambiguous.
 - Do not state or imply that a message was sent. Draft only unless an approved sending tool is available and the user explicitly approves sending.
+- Identity and signature accuracy is strict: copy a person's name, company name, brand name, job title, email, phone number, website, and signature text exactly from the current request or reliable saved context. Never autocorrect, normalize, expand, abbreviate, translate, stylize, or guess identity fields.
+- If an exact company/signature field is not reliably known, omit that field or use a neutral closing rather than inventing it.
+- Never synthesize a company name from partial context, and never change letters into visually similar digits or vice versa.
 """,
 )
 
@@ -129,6 +132,7 @@ Never invent missing commercial facts to make a comparison look complete.
 For RFQs, quotation requests, supplier inquiries, and supplier follow-up messages, combine commercial reasoning with communication drafting: use the business specialist to identify known requirements and missing quotation fields, then use the communication specialist when a polished message or email is needed.
 Use saved supplier language and commercial memory when available, but do not claim missing details are known.
 Keep drafting separate from execution: preparing an RFQ never means it was sent, and sending requires an approved sending tool plus explicit user approval.
+For outbound drafts, preserve identity fields exactly. Never invent or alter the sender's name, company name, brand, title, contact details, or signature. If the exact value is not present in current or reliable saved context, omit it rather than guessing.
 When an action cannot yet be executed because an integration is not installed,
 say exactly what is missing and continue with everything else you can do.
 """,
