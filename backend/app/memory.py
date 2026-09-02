@@ -154,6 +154,48 @@ CREATE TABLE IF NOT EXISTS commercial_supplier_languages (
 
 CREATE INDEX IF NOT EXISTS idx_commercial_supplier_languages_user
 ON commercial_supplier_languages(user_id, supplier_id);
+
+CREATE TABLE IF NOT EXISTS commercial_deals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    supplier_id INTEGER NOT NULL,
+    product_id INTEGER,
+    offer_id INTEGER,
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'negotiating',
+    waiting_on TEXT,
+    next_action TEXT,
+    next_action_due TEXT,
+    notes TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    closed_at DATETIME,
+    FOREIGN KEY(supplier_id) REFERENCES commercial_suppliers(id),
+    FOREIGN KEY(product_id) REFERENCES commercial_products(id),
+    FOREIGN KEY(offer_id) REFERENCES commercial_offers(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_deals_user
+ON commercial_deals(user_id, is_active, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_deals_supplier
+ON commercial_deals(user_id, supplier_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS commercial_deal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    deal_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    source TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(deal_id) REFERENCES commercial_deals(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commercial_deal_events_deal
+ON commercial_deal_events(user_id, deal_id, created_at);
+
 """
 
 async def init_db():
@@ -958,6 +1000,275 @@ async def delete_commercial_offer(user_id: str, offer_id: int):
         )
         await db.commit()
     return True
+
+
+COMMERCIAL_DEAL_STATUSES = {
+    "negotiating",
+    "waiting_supplier",
+    "awaiting_sample",
+    "awaiting_pi",
+    "production",
+    "inspection",
+    "ready_to_ship",
+    "completed",
+    "cancelled",
+}
+
+
+def _validate_commercial_deal_status(status: str) -> str:
+    value = (status or "").strip().casefold()
+    if value not in COMMERCIAL_DEAL_STATUSES:
+        raise ValueError(f"Unsupported commercial deal status: {status}")
+    return value
+
+
+async def create_commercial_deal(
+    user_id: str,
+    supplier_id: int,
+    product_id: int | None = None,
+    offer_id: int | None = None,
+    title: str | None = None,
+    status: str = "negotiating",
+    waiting_on: str | None = None,
+    next_action: str | None = None,
+    next_action_due: str | None = None,
+    notes: str | None = None,
+) -> int:
+    status = _validate_commercial_deal_status(status)
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO commercial_deals(
+                user_id, supplier_id, product_id, offer_id, title, status,
+                waiting_on, next_action, next_action_due, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, supplier_id, product_id, offer_id, title, status,
+                waiting_on, next_action, next_action_due, notes,
+            ),
+        )
+        deal_id = int(cur.lastrowid)
+        await db.execute(
+            """
+            INSERT INTO commercial_deal_events(
+                user_id, deal_id, event_type, summary, source
+            )
+            VALUES (?, ?, 'deal_created', ?, 'system')
+            """,
+            (user_id, deal_id, f"Deal created with status={status}"),
+        )
+        await db.commit()
+        return deal_id
+
+
+async def get_commercial_deal_by_id(user_id: str, deal_id: int):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT
+                d.id, d.supplier_id, s.name, d.product_id, p.product_name,
+                d.offer_id, d.title, d.status, d.waiting_on, d.next_action,
+                d.next_action_due, d.notes, d.is_active, d.created_at,
+                d.updated_at, d.closed_at
+            FROM commercial_deals d
+            LEFT JOIN commercial_suppliers s ON s.id=d.supplier_id
+            LEFT JOIN commercial_products p ON p.id=d.product_id
+            WHERE d.user_id=? AND d.id=?
+            LIMIT 1
+            """,
+            (user_id, deal_id),
+        )
+        row = await cur.fetchone()
+    if not row:
+        return None
+    keys = (
+        "id", "supplier_id", "supplier", "product_id", "product",
+        "offer_id", "title", "status", "waiting_on", "next_action",
+        "next_action_due", "notes", "is_active", "created_at",
+        "updated_at", "closed_at",
+    )
+    return dict(zip(keys, row))
+
+
+async def get_commercial_deals(
+    user_id: str,
+    active_only: bool = True,
+    supplier_id: int | None = None,
+    limit: int = 50,
+):
+    clauses = ["d.user_id=?"]
+    params: list[object] = [user_id]
+    if active_only:
+        clauses.append("d.is_active=1")
+    if supplier_id is not None:
+        clauses.append("d.supplier_id=?")
+        params.append(supplier_id)
+    params.append(max(1, min(int(limit), 200)))
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            f"""
+            SELECT
+                d.id, d.supplier_id, s.name, d.product_id, p.product_name,
+                d.offer_id, d.title, d.status, d.waiting_on, d.next_action,
+                d.next_action_due, d.notes, d.is_active, d.created_at,
+                d.updated_at, d.closed_at
+            FROM commercial_deals d
+            LEFT JOIN commercial_suppliers s ON s.id=d.supplier_id
+            LEFT JOIN commercial_products p ON p.id=d.product_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY d.updated_at DESC, d.id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        rows = await cur.fetchall()
+
+    keys = (
+        "id", "supplier_id", "supplier", "product_id", "product",
+        "offer_id", "title", "status", "waiting_on", "next_action",
+        "next_action_due", "notes", "is_active", "created_at",
+        "updated_at", "closed_at",
+    )
+    return [dict(zip(keys, row)) for row in rows]
+
+
+async def update_commercial_deal(
+    user_id: str,
+    deal_id: int,
+    *,
+    status: str | None = None,
+    waiting_on: str | None = None,
+    next_action: str | None = None,
+    next_action_due: str | None = None,
+    offer_id: int | None = None,
+    title: str | None = None,
+    notes: str | None = None,
+):
+    current = await get_commercial_deal_by_id(user_id, deal_id)
+    if not current:
+        return False
+
+    changes = {}
+    if status is not None:
+        changes["status"] = _validate_commercial_deal_status(status)
+    if waiting_on is not None:
+        changes["waiting_on"] = waiting_on
+    if next_action is not None:
+        changes["next_action"] = next_action
+    if next_action_due is not None:
+        changes["next_action_due"] = next_action_due
+    if offer_id is not None:
+        changes["offer_id"] = offer_id
+    if title is not None:
+        changes["title"] = title
+    if notes is not None:
+        changes["notes"] = notes
+    if not changes:
+        return True
+
+    assignments = [f"{key}=?" for key in changes]
+    params = list(changes.values())
+
+    new_status = changes.get("status", current["status"])
+    if new_status in {"completed", "cancelled"}:
+        assignments.extend(["is_active=0", "closed_at=CURRENT_TIMESTAMP"])
+    elif "status" in changes:
+        assignments.extend(["is_active=1", "closed_at=NULL"])
+    assignments.append("updated_at=CURRENT_TIMESTAMP")
+
+    params.extend([user_id, deal_id])
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            f"""
+            UPDATE commercial_deals
+            SET {', '.join(assignments)}
+            WHERE user_id=? AND id=?
+            """,
+            tuple(params),
+        )
+        summary = "; ".join(f"{k}={v}" for k, v in changes.items())
+        await db.execute(
+            """
+            INSERT INTO commercial_deal_events(
+                user_id, deal_id, event_type, summary, source
+            )
+            VALUES (?, ?, 'deal_updated', ?, 'user')
+            """,
+            (user_id, deal_id, summary),
+        )
+        await db.commit()
+    return True
+
+
+async def add_commercial_deal_event(
+    user_id: str,
+    deal_id: int,
+    event_type: str,
+    summary: str,
+    source: str | None = None,
+) -> int:
+    event_type = (event_type or "").strip()
+    summary = (summary or "").strip()
+    if not event_type or not summary:
+        raise ValueError("Deal event type and summary are required")
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO commercial_deal_events(
+                user_id, deal_id, event_type, summary, source
+            )
+            SELECT ?, id, ?, ?, ?
+            FROM commercial_deals
+            WHERE user_id=? AND id=?
+            """,
+            (user_id, event_type, summary, source, user_id, deal_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Commercial deal was not found")
+        await db.execute(
+            """
+            UPDATE commercial_deals
+            SET updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND id=?
+            """,
+            (user_id, deal_id),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
+
+
+async def get_commercial_deal_events(
+    user_id: str,
+    deal_id: int,
+    limit: int = 50,
+):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, event_type, summary, source, created_at
+            FROM commercial_deal_events
+            WHERE user_id=? AND deal_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, deal_id, max(1, min(int(limit), 200))),
+        )
+        rows = await cur.fetchall()
+    return [
+        {
+            "id": r[0],
+            "event_type": r[1],
+            "summary": r[2],
+            "source": r[3],
+            "created_at": r[4],
+        }
+        for r in reversed(rows)
+    ]
+
 
 def _commercial_size_key(value):
     if value is None:
