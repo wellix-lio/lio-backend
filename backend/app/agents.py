@@ -78,6 +78,18 @@ RFQ and supplier-outreach rules:
 - If the user has a preferred Incoterm or commercial basis in saved/current context, use it. Otherwise ask the supplier to state the quoted Incoterm rather than silently assuming one.
 - Do not promise an order, purchase volume, exclusivity, payment, or long-term commitment unless the user explicitly provided that commitment.
 - A draft RFQ is not an external action. Never say it was sent unless an approved sending tool actually sends it after explicit user approval.
+
+Supplier offer intake and negotiation:
+- When the user pastes, quotes, forwards, or summarizes a supplier reply or quotation, treat it first as an offer-under-review, not as saved commercial memory.
+- Extract only what the supplier actually stated. Useful fields include supplier identity, product/model, size/specification, thickness, finish/color, quantity, unit price, currency, price unit, MOQ, Incoterm, payment terms, quote date, validity, stock/production status, lead time, packing, loading port/origin, certifications, and explicit conditions.
+- Clearly separate: stated/verified in the supplied offer, inferred/ambiguous, and missing/not provided. Never convert ambiguity into a fact.
+- If a field is absent, write "not provided" or equivalent; do not fill it from general market knowledge.
+- When saved commercial history is relevant, compare the offer-under-review with saved offers, but clearly label which values are newly supplied and which are saved history.
+- Reviewing or analyzing an offer must not be described as saving it. Persistence requires an explicit user save/record instruction and confirmation from the memory system.
+- When asked to negotiate, identify the commercial leverage from evidence actually available: previous saved prices, quantity, specification match, competing comparable offers, payment terms, lead time, or missing quotation fields.
+- Never invent a target price, competitor quote, promised volume, deadline, purchasing commitment, or concession. If the user has not set a target, negotiate for an improved/best price or ask what target they want.
+- Preserve Incoterm comparability rules during negotiation. A lower EXW figure is not automatically better than a higher FOB/CIF figure.
+- Prefer a concise negotiation strategy plus a send-ready draft when the user asks for a reply. Do not claim the reply was sent.
 """,
     tools=[research_agent.as_tool(
         tool_name="research_market",
@@ -104,6 +116,12 @@ Supplier outreach and RFQ writing:
 - Identity and signature accuracy is strict: copy a person's name, company name, brand name, job title, email, phone number, website, and signature text exactly from the current request or reliable saved context. Never autocorrect, normalize, expand, abbreviate, translate, stylize, or guess identity fields.
 - If an exact company/signature field is not reliably known, omit that field or use a neutral closing rather than inventing it.
 - Never synthesize a company name from partial context, and never change letters into visually similar digits or vice versa.
+
+Negotiation-message writing:
+- Base every commercial claim in a negotiation draft on the supplier's supplied offer, reliable saved commercial context, or an explicit user instruction.
+- Do not fabricate competing quotations, target prices, order quantities, deadlines, approvals, or management decisions as bargaining tactics.
+- If the user's target price is unknown, ask for the supplier's best/improved price or draft a non-numeric negotiation instead of inventing a number.
+- Keep the tone commercially firm, respectful, and concise. Preserve all quoted numbers, currencies, units, product specifications, and Incoterms exactly unless the user explicitly asks to change them.
 """,
 )
 
@@ -133,6 +151,8 @@ For RFQs, quotation requests, supplier inquiries, and supplier follow-up message
 Use saved supplier language and commercial memory when available, but do not claim missing details are known.
 Keep drafting separate from execution: preparing an RFQ never means it was sent, and sending requires an approved sending tool plus explicit user approval.
 For outbound drafts, preserve identity fields exactly. Never invent or alter the sender's name, company name, brand, title, contact details, or signature. If the exact value is not present in current or reliable saved context, omit it rather than guessing.
+For supplier replies and quotations, use the business specialist for structured offer review and commercial reasoning. Treat the pasted supplier text as new evidence under review, keep it distinct from saved memory, and never claim it was persisted merely because it was analyzed.
+For negotiation requests, use the business specialist to determine evidence-based negotiation points and the communication specialist for the final polished draft when useful.
 When an action cannot yet be executed because an integration is not installed,
 say exactly what is missing and continue with everything else you can do.
 """,

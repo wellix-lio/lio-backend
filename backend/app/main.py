@@ -301,6 +301,20 @@ def _clean_commercial_supplier_name(value: str | None):
 
 def _commercial_save_intent(message: str) -> bool:
     folded = message.casefold()
+
+    # Remove explicitly negated save/record phrases before checking positive save intent.
+    # This prevents analysis requests such as "analyze this offer and do not save it"
+    # from becoming persistence commands, while still allowing mixed instructions such
+    # as "save the supplier, but do not save a price".
+    positive_scan = folded
+    negative_save_phrases = (
+        "لا تحفظ", "لا تسجل", "لا تسجّل", "بدون حفظ", "دون حفظ",
+        "do not save", "don't save", "do not record", "don't record",
+        "do not remember", "don't remember",
+        "nicht speichern", "nicht merken", "nicht aufzeichnen",
+    )
+    for phrase in negative_save_phrases:
+        positive_scan = positive_scan.replace(phrase, " ")
     save_words = (
         "احفظ", "سجل", "سجّل", "تذكر", "تذكّر",
         "remember", "save", "record",
@@ -312,7 +326,7 @@ def _commercial_save_intent(message: str) -> bool:
         "supplier", "factory", "vendor", "quote", "price", "offer",
         "lieferant", "fabrik", "angebot", "preis",
     )
-    return any(word in folded for word in save_words) and any(
+    return any(word in positive_scan for word in save_words) and any(
         word in folded for word in commercial_words
     )
 
@@ -342,6 +356,21 @@ def _extract_commercial_record(message: str):
         )
         if legal_name_match:
             legal_name = legal_name_match.group(1).strip(" \t-,:;")
+
+            # The surrounding sentence may begin with a role label such as
+            # "Supplier Test Ceramics Co., Ltd.". The label is not part of
+            # the legal company name. Remove it only when the already-parsed
+            # supplier name is still preserved in the remaining text.
+            label_match = re.match(
+                r"^(?:supplier|factory|vendor|company|lieferant|fabrik|firma)\s+(.+)$",
+                legal_name,
+                flags=re.IGNORECASE,
+            )
+            if label_match:
+                without_label = label_match.group(1).strip(" \t-,:;")
+                if supplier.casefold() in without_label.casefold():
+                    legal_name = without_label
+
             if supplier.casefold() in legal_name.casefold():
                 supplier = legal_name
     if not supplier:
@@ -566,8 +595,53 @@ def _extract_commercial_record(message: str):
     }
 
 
+def _is_referential_offer_save(message: str) -> bool:
+    if not _commercial_save_intent(message):
+        return False
+    folded = (message or "").casefold()
+    references = (
+        "هذا العرض", "العرض السابق", "العرض أعلاه", "العرض اعلاه",
+        "العرض الذي أرسلته", "العرض الذي ارسلته",
+        "this offer", "the offer above", "previous offer", "that offer",
+        "dieses angebot", "das angebot oben", "vorheriges angebot",
+    )
+    return any(ref in folded for ref in references)
+
+
+def _looks_like_supplier_offer_text(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "سعر", "دولار", "يورو", "يوان", "عرض", "عرضت", "قال",
+        "price", "usd", "eur", "cny", "rmb", "quote", "quoted", "offer",
+        "preis", "angebot",
+        "moq", "exw", "fob", "cif", "cfr", "ddp", "dap", "fca",
+        "payment", "lead time", "delivery", "packing",
+        "الدفع", "مدة", "التجهيز", "التسليم", "التعبئة",
+    )
+    return any(signal in folded for signal in signals) and any(ch.isdigit() for ch in message)
+
+
 async def _capture_commercial_memory(user_id: str, message: str):
     record = _extract_commercial_record(message)
+
+    # Review-then-save workflow:
+    # If the user says "save this offer" after first pasting/analyzing it,
+    # recover only the most recent USER-authored offer-like text.
+    # Never use assistant-generated analysis as the persistence source.
+    if not record and _is_referential_offer_save(message):
+        history = await recent_messages(user_id, 12)
+        for item in reversed(history):
+            if item.get("role") != "user":
+                continue
+            prior = (item.get("content") or "").strip()
+            if not prior or not _looks_like_supplier_offer_text(prior):
+                continue
+            candidate = prior + "\n" + message
+            candidate_record = _extract_commercial_record(candidate)
+            if candidate_record:
+                record = candidate_record
+                break
+
     if not record:
         return None
 
