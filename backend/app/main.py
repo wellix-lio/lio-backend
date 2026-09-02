@@ -1383,6 +1383,172 @@ def _extract_deal_followup_request(message: str):
 
 
 
+
+def _is_supplier_reply_handoff_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        # Arabic
+        "المورد رد", "رد المورد", "وصل رد المورد", "وصلني رد المورد",
+        "استلمت رد المورد", "استلمنا رد المورد", "أرسل المورد رده", "ارسل المورد رده",
+        # English
+        "supplier replied", "supplier responded", "supplier has replied",
+        "supplier has responded", "received the supplier reply",
+        "received a reply from the supplier", "got the supplier reply",
+        "reply from the supplier",
+        # German
+        "lieferant hat geantwortet", "der lieferant hat geantwortet",
+        "antwort vom lieferanten erhalten", "antwort des lieferanten erhalten",
+        "lieferantenantwort erhalten",
+    )
+    return any(signal in folded for signal in signals)
+
+
+def _extract_supplier_reply_handoff_supplier_query(message: str):
+    patterns = (
+        # English: "Supplier ABC replied", "reply from supplier ABC"
+        r"\bsupplier\s+(.+?)\s+(?:replied|responded|has\s+replied|has\s+responded)\b",
+        r"\breply\s+from\s+(?:supplier\s+)?(.+?)(?=[:;,.\n]|$)",
+        r"\bresponse\s+from\s+(?:supplier\s+)?(.+?)(?=[:;,.\n]|$)",
+        # German
+        r"\blieferant\s+(.+?)\s+hat\s+geantwortet\b",
+        r"\bantwort\s+(?:vom|von\s+dem)\s+lieferanten\s+(.+?)(?=[:;,.\n]|$)",
+        # Arabic
+        r"(?:المورد|مورد)\s+(.+?)\s+(?:رد|أرسل\s+رده|ارسل\s+رده)(?=[،,:;.\n]|$)",
+        r"(?:رد|جواب)\s+(?:من\s+)?(?:المورد\s+)?(.+?)(?=[،,:;.\n]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message or "", flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = _clean_value(match.group(1))
+        if value and value.casefold() not in {
+            "the supplier", "supplier", "المورد", "مورد",
+            "der lieferant", "lieferant",
+        }:
+            return value
+    return None
+
+
+def _extract_supplier_reply_handoff_request(message: str):
+    if not _is_supplier_reply_handoff_request(message):
+        return None
+
+    ascii_message = _deal_followup_ascii_digits(message or "")
+    id_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        ascii_message,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = " ".join((message or "").strip().split())
+    if len(cleaned) > 700:
+        cleaned = cleaned[:697] + "..."
+
+    return {
+        "deal_id": int(id_match.group(1)) if id_match else None,
+        "supplier_query": _extract_supplier_reply_handoff_supplier_query(message),
+        "event_summary": f"User-stated supplier reply received: {cleaned}",
+        "explicit_commercial_save": _commercial_save_intent(message),
+    }
+
+
+async def _capture_supplier_reply_handoff(user_id: str, message: str):
+    request = _extract_supplier_reply_handoff_request(message)
+    if not request:
+        return None
+
+    deal = None
+
+    if request["deal_id"] is not None:
+        deal = await get_commercial_deal_by_id(user_id, request["deal_id"])
+        if not deal:
+            return "Supplier reply handoff not recorded: deal #%s was not found." % request["deal_id"]
+        if not deal.get("is_active"):
+            return "Supplier reply handoff not recorded: deal #%s is not active." % request["deal_id"]
+
+    elif request["supplier_query"]:
+        supplier, error = await _resolve_management_supplier(
+            user_id, request["supplier_query"]
+        )
+        if error:
+            return error.replace("Commercial management", "Supplier reply handoff")
+
+        deals = await get_commercial_deals(
+            user_id,
+            active_only=True,
+            supplier_id=supplier["id"],
+            limit=10,
+        )
+        if not deals:
+            return (
+                "Supplier reply handoff not recorded: no active deal exists for supplier "
+                f"{supplier['name']}."
+            )
+        if len(deals) > 1:
+            return (
+                "Supplier reply handoff not recorded: multiple active deals exist for supplier "
+                f"{supplier['name']}; specify the deal ID."
+            )
+        deal = deals[0]
+
+    else:
+        deals = await get_commercial_deals(user_id, active_only=True, limit=20)
+        if not deals:
+            return "Supplier reply handoff not recorded: there is no active deal."
+        if len(deals) > 1:
+            return (
+                "Supplier reply handoff not recorded: multiple active deals exist; "
+                "specify the deal ID or supplier."
+            )
+        deal = deals[0]
+
+    # A supplier reply ends the old "follow up if no reply" waiting period.
+    changed = await update_commercial_deal(
+        user_id,
+        deal["id"],
+        waiting_on="user",
+        next_action="Review supplier response and reply",
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return "Supplier reply handoff not recorded: deal update failed."
+
+    await add_commercial_deal_event(
+        user_id,
+        deal["id"],
+        "supplier_reply_received",
+        request["event_summary"],
+        source="user",
+    )
+
+    commercial_save_status = None
+    if request["explicit_commercial_save"]:
+        commercial_save_status = await _capture_commercial_memory(user_id, message)
+        if not commercial_save_status:
+            commercial_save_status = (
+                "Commercial save was explicitly requested but no complete commercial "
+                "record could be extracted from this message."
+            )
+
+    parts = [
+        f"Supplier reply handoff recorded: deal_id={deal['id']}",
+        f"supplier={deal.get('supplier')}",
+        "waiting_on=user",
+        "next_action=Review supplier response and reply",
+    ]
+    if deal.get("next_action_due"):
+        parts.append("previous internal no-reply follow-up due date cleared")
+    parts.append("event=supplier_reply_received")
+    parts.append("No new deal was created")
+
+    if commercial_save_status:
+        parts.append(f"commercial_save_status={commercial_save_status}")
+    else:
+        parts.append(
+            "Commercial terms in the reply were not saved because no explicit commercial save was requested"
+        )
+
+    return "; ".join(parts) + "."
 def _is_deal_followup_outcome_request(message: str) -> bool:
     folded = (message or "").casefold()
     signals = (
@@ -1759,6 +1925,10 @@ async def _capture_user_memory(user_id: str, message: str):
     management_action = await _capture_commercial_management(user_id, message)
     if management_action:
         return management_action
+
+    supplier_reply_action = await _capture_supplier_reply_handoff(user_id, message)
+    if supplier_reply_action:
+        return supplier_reply_action
 
     followup_outcome_action = await _capture_deal_followup_outcome(user_id, message)
     if followup_outcome_action:

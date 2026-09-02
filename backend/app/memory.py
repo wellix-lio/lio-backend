@@ -1143,6 +1143,7 @@ async def update_commercial_deal(
     waiting_on: str | None = None,
     next_action: str | None = None,
     next_action_due: str | None = None,
+    clear_next_action_due: bool = False,
     offer_id: int | None = None,
     title: str | None = None,
     notes: str | None = None,
@@ -1158,7 +1159,9 @@ async def update_commercial_deal(
         changes["waiting_on"] = waiting_on
     if next_action is not None:
         changes["next_action"] = next_action
-    if next_action_due is not None:
+    if clear_next_action_due:
+        changes["next_action_due"] = None
+    elif next_action_due is not None:
         changes["next_action_due"] = next_action_due
     if offer_id is not None:
         changes["offer_id"] = offer_id

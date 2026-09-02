@@ -53,6 +53,13 @@ Commercial deal follow-up clarity:
 - Recording that the user sent a follow-up means the system recorded the user's statement; it does not mean Lio itself sent the message.
 - Outcome/rescheduling updates must target an existing active deal. Never imply a new deal was created from a follow-up outcome unless persistence explicitly confirms creation.
 - If multiple active deals could match an outcome and the user did not identify one, require deal ID or supplier instead of guessing.
+
+- A supplier reply handoff is deal-tracking state, not automatic commercial-offer persistence. Recording supplier_reply_received must not by itself save prices, MOQ, payment terms, lead time, or other offer facts.
+- When a supplier reply is recorded for an active deal, waiting_on should move to the user and the next action should become review/reply unless the user explicitly states another supported action.
+- If the old next_action_due represented a no-reply follow-up, clear that internal due date when a supplier reply is received; the reply has satisfied the reason for that follow-up.
+- If the same user message explicitly asks to save/record the supplier's commercial offer, the normal commercial save rules may run separately. Clearly distinguish the deal handoff result from the commercial save result.
+- Never infer that commercial terms were saved merely because a supplier reply was recorded. Persistence of offer facts requires explicit save intent and successful commercial extraction/persistence.
+- Supplier reply text recorded as an event remains user-provided tracking evidence. Do not present its commercial details as persistent supplier-stated offer facts unless the commercial save path confirms them.
 """
 
 SUPPLIER_FOLLOWUP_DRAFTING_RULES = """
