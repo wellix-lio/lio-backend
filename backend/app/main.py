@@ -547,16 +547,36 @@ def _extract_commercial_record(message: str):
         if lead_time_value is not None:
             lead_time_days = int(lead_time_value)
 
-    date_match = re.search(
-        r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b|\b(\d{1,2})[./](\d{1,2})[./](20\d{2})\b",
-        message,
-    )
     quote_date = None
-    if date_match:
-        if date_match.group(1):
-            quote_date = f"{int(date_match.group(1)):04d}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
-        else:
-            quote_date = f"{int(date_match.group(6)):04d}-{int(date_match.group(5)):02d}-{int(date_match.group(4)):02d}"
+    quote_date_match = re.search(
+        r"(?:quote\s+date|quotation\s+date|offer\s+date|dated|"
+        r"تاريخ\s+(?:عرض\s+السعر|العرض)|بتاريخ|"
+        r"angebotsdatum|angebot\s+vom)\s*[:=]?\s*"
+        r"((?:20\d{2})[-/.]\d{1,2}[-/.]\d{1,2}|"
+        r"\d{1,2}[./]\d{1,2}[./](?:20\d{2}))",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if quote_date_match:
+        raw_quote_date = quote_date_match.group(1)
+        quote_date_parts = re.match(
+            r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})|"
+            r"(\d{1,2})[./](\d{1,2})[./](20\d{2})",
+            raw_quote_date,
+        )
+        if quote_date_parts:
+            if quote_date_parts.group(1):
+                quote_date = (
+                    f"{int(quote_date_parts.group(1)):04d}-"
+                    f"{int(quote_date_parts.group(2)):02d}-"
+                    f"{int(quote_date_parts.group(3)):02d}"
+                )
+            else:
+                quote_date = (
+                    f"{int(quote_date_parts.group(6)):04d}-"
+                    f"{int(quote_date_parts.group(5)):02d}-"
+                    f"{int(quote_date_parts.group(4)):02d}"
+                )
 
     valid_until = None
     valid_until_match = re.search(
