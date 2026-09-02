@@ -958,3 +958,178 @@ async def delete_commercial_offer(user_id: str, offer_id: int):
         )
         await db.commit()
     return True
+
+def _commercial_size_key(value):
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    for token in ("×", "*", "X"):
+        text = text.replace(token, "x")
+    text = text.replace(" ", "")
+    return text or None
+
+
+def _commercial_product_terms(value):
+    text = (value or "").strip().casefold()
+    if not text:
+        return []
+    aliases = (
+        ("porcelain", "بورسلان", "بورسلين", "porzellan", "feinsteinzeug"),
+        ("ceramic", "سيراميك", "keramik"),
+    )
+    for group in aliases:
+        if any(term in text for term in group):
+            return list(group)
+    return [value.strip()]
+
+
+async def get_commercial_offer_comparison(
+    user_id: str,
+    product_query: str | None = None,
+    size_query: str | None = None,
+    supplier_ids: list[int] | None = None,
+    latest_per_supplier: bool = True,
+    limit: int = 100,
+):
+    """Prepare saved offers for safe supplier/offer comparison."""
+    limit = max(1, min(int(limit or 100), 500))
+    product_query = (product_query or "").strip()
+    wanted_size = _commercial_size_key(size_query)
+
+    where = ["o.user_id=?"]
+    params = [user_id]
+
+    if product_query:
+        product_terms = _commercial_product_terms(product_query)
+        product_clauses = [
+            "LOWER(COALESCE(p.product_name,'')) LIKE LOWER(?)"
+            for _ in product_terms
+        ]
+        where.append("(" + " OR ".join(product_clauses) + ")")
+        params.extend(f"%{term}%" for term in product_terms)
+
+    if supplier_ids:
+        clean_ids = [int(x) for x in supplier_ids]
+        placeholders = ",".join("?" for _ in clean_ids)
+        where.append(f"o.supplier_id IN ({placeholders})")
+        params.extend(clean_ids)
+
+    query = f"""
+        SELECT
+            o.id, o.supplier_id, o.product_id,
+            s.name AS supplier, s.country, s.city, s.website, s.contact_name,
+            s.email, s.phone, s.supplier_type, s.status AS supplier_status,
+            p.product_name AS product, p.category, p.size, p.thickness_mm,
+            p.finish, p.color, p.model,
+            o.price, o.currency, o.price_unit, o.quantity, o.moq, o.incoterm,
+            o.payment_terms, o.quote_date, o.valid_until, o.lead_time_days,
+            o.status AS offer_status, o.source, o.notes, o.created_at
+        FROM commercial_offers o
+        LEFT JOIN commercial_suppliers s ON s.id=o.supplier_id
+        LEFT JOIN commercial_products p ON p.id=o.product_id
+        WHERE {" AND ".join(where)}
+        ORDER BY
+            o.supplier_id,
+            CASE WHEN o.quote_date IS NULL OR o.quote_date='' THEN 1 ELSE 0 END,
+            o.quote_date DESC,
+            o.id DESC
+        LIMIT ?
+    """
+    params.append(limit)
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(query, tuple(params))
+        rows = [dict(row) for row in await cur.fetchall()]
+
+        ids = sorted({int(r["supplier_id"]) for r in rows if r.get("supplier_id") is not None})
+        language_map = {}
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            cur = await db.execute(
+                f"""
+                SELECT supplier_id, language
+                FROM commercial_supplier_languages
+                WHERE user_id=? AND supplier_id IN ({placeholders})
+                ORDER BY supplier_id, language
+                """,
+                (user_id, *ids),
+            )
+            for supplier_id, language in await cur.fetchall():
+                language_map.setdefault(int(supplier_id), []).append(language)
+
+    if wanted_size:
+        rows = [r for r in rows if _commercial_size_key(r.get("size")) == wanted_size]
+
+    if latest_per_supplier:
+        newest = []
+        seen = set()
+        for row in rows:
+            sid = row.get("supplier_id")
+            if sid in seen:
+                continue
+            seen.add(sid)
+            newest.append(row)
+        rows = newest
+
+    missing_watch = (
+        "price", "currency", "price_unit", "incoterm", "payment_terms",
+        "quote_date", "valid_until", "lead_time_days", "moq",
+    )
+
+    for row in rows:
+        sid = row.get("supplier_id")
+        row["languages"] = language_map.get(int(sid), []) if sid is not None else []
+        row["missing_fields"] = [
+            field for field in missing_watch
+            if row.get(field) is None or row.get(field) == ""
+        ]
+        row["price_rank"] = None
+        row["comparable_price_count"] = 0
+        row["is_lowest_saved_price"] = False
+
+    groups = {}
+    for row in rows:
+        if row.get("price") is None or not row.get("currency") or not row.get("price_unit"):
+            continue
+        key = (str(row["currency"]).upper(), str(row["price_unit"]).lower())
+        groups.setdefault(key, []).append(row)
+
+    comparable_groups = []
+    for (currency, price_unit), members in sorted(groups.items()):
+        ordered = sorted(members, key=lambda item: (float(item["price"]), int(item["id"])))
+        for rank, item in enumerate(ordered, start=1):
+            item["price_rank"] = rank
+            item["comparable_price_count"] = len(ordered)
+            item["is_lowest_saved_price"] = rank == 1
+
+        comparable_groups.append({
+            "currency": currency,
+            "price_unit": price_unit,
+            "offer_count": len(ordered),
+            "offer_ids_by_price": [int(item["id"]) for item in ordered],
+            "lowest_price": float(ordered[0]["price"]) if ordered else None,
+        })
+
+    warnings = []
+    if len(comparable_groups) > 1:
+        warnings.append(
+            "Offers use different currency and/or price units. "
+            "They were not ranked against each other and no FX conversion was performed."
+        )
+    if any(
+        row.get("price") is None or not row.get("currency") or not row.get("price_unit")
+        for row in rows
+    ):
+        warnings.append(
+            "Some offers have incomplete price data and were excluded from price ranking."
+        )
+
+    return {
+        "product_query": product_query or None,
+        "size_query": size_query or None,
+        "latest_per_supplier": bool(latest_per_supplier),
+        "offers": rows,
+        "comparable_price_groups": comparable_groups,
+        "warnings": warnings,
+    }

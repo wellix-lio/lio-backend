@@ -31,6 +31,7 @@ from .memory import (
     update_commercial_supplier,
     update_commercial_offer,
     delete_commercial_offer,
+    get_commercial_offer_comparison,
     get_commercial_memory,
 )
 
@@ -885,6 +886,136 @@ async def _capture_user_memory(user_id: str, message: str):
 
     return commercial_action
 
+def _is_commercial_comparison_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "قارن", "مقارنة", "الأفضل", "الافضل", "أفضل مورد", "افضل مورد",
+        "أرخص", "ارخص", "أقل سعر", "اقل سعر",
+        "compare", "comparison", "best supplier", "cheapest", "lowest price",
+        "vergleichen", "vergleich", "bester lieferant", "beste lieferant",
+        "günstigste", "guenstigste", "niedrigster preis",
+    )
+    commercial_words = (
+        "عرض", "عروض", "مورد", "موردين", "سعر", "أسعار", "اسعار",
+        "offer", "offers", "supplier", "suppliers", "price", "prices",
+        "angebot", "angebote", "lieferant", "lieferanten", "preis", "preise",
+        "بورسلان", "بورسلين", "سيراميك", "porcelain", "ceramic",
+        "porzellan", "feinsteinzeug", "keramik",
+    )
+    return any(x in folded for x in signals) and any(x in folded for x in commercial_words)
+
+
+def _extract_comparison_size(message: str):
+    match = re.search(r"\b(\d{2,4})\s*[xX×*/]\s*(\d{2,4})\b", message or "")
+    if not match:
+        return None
+    return f"{match.group(1)}x{match.group(2)}"
+
+
+def _extract_comparison_product(message: str):
+    folded = (message or "").casefold()
+    groups = (
+        ("porcelain", ("porcelain", "بورسلان", "بورسلين", "porzellan", "feinsteinzeug")),
+        ("ceramic", ("ceramic", "سيراميك", "keramik")),
+    )
+    for canonical, terms in groups:
+        if any(term in folded for term in terms):
+            return canonical
+    return None
+
+
+async def _commercial_comparison_context(user_id: str, message: str) -> str:
+    if not _is_commercial_comparison_request(message):
+        return ""
+
+    product_query = _extract_comparison_product(message)
+    size_query = _extract_comparison_size(message)
+
+    data = await get_commercial_offer_comparison(
+        user_id,
+        product_query=product_query,
+        size_query=size_query,
+        latest_per_supplier=True,
+        limit=100,
+    )
+    offers = data.get("offers", [])
+
+    lines = [
+        "CURRENT COMMERCIAL COMPARISON SNAPSHOT.",
+        "Use this saved-data snapshot as the authoritative basis for this turn's comparison.",
+        "Do not invent missing commercial facts.",
+        "Do not compare prices across different currencies or price units unless the user explicitly asks for conversion and a reliable conversion is separately available.",
+        "A lowest price means lowest only inside the same currency + price-unit group.",
+        "Different Incoterms are not directly equivalent; mention that when relevant.",
+        "Do not call a supplier 'best overall' solely because its saved price is lower. Consider thickness, Incoterm, MOQ, payment terms, lead time, quote date/validity, and missing data when those fields exist.",
+        "Historical offers remain saved; this snapshot shows the latest matching saved offer per supplier.",
+    ]
+
+    if product_query:
+        lines.append(f"Requested product filter: {product_query}")
+    if size_query:
+        lines.append(f"Requested size filter: {size_query}")
+
+    if not offers:
+        lines.append("No matching saved offers were found.")
+        return "\n".join(lines)
+
+    lines.append(f"Matching latest offers: {len(offers)}")
+    for item in offers:
+        details = [
+            f"offer_id={item.get('id')}",
+            f"supplier={item.get('supplier')}",
+            f"country={item.get('country')}" if item.get("country") else None,
+            f"city={item.get('city')}" if item.get("city") else None,
+            f"languages={','.join(item.get('languages') or [])}" if item.get("languages") else None,
+            f"product={item.get('product')}" if item.get("product") else None,
+            f"size={item.get('size')}" if item.get("size") else None,
+            f"thickness_mm={item.get('thickness_mm')}" if item.get("thickness_mm") is not None else None,
+            f"finish={item.get('finish')}" if item.get("finish") else None,
+            f"color={item.get('color')}" if item.get("color") else None,
+            f"price={item.get('price')}" if item.get("price") is not None else None,
+            f"currency={item.get('currency')}" if item.get("currency") else None,
+            f"unit={item.get('price_unit')}" if item.get("price_unit") else None,
+            f"price_rank={item.get('price_rank')}" if item.get("price_rank") is not None else None,
+            f"comparable_price_count={item.get('comparable_price_count')}" if item.get("comparable_price_count") else None,
+            f"quantity={item.get('quantity')}" if item.get("quantity") is not None else None,
+            f"moq={item.get('moq')}" if item.get("moq") is not None else None,
+            f"incoterm={item.get('incoterm')}" if item.get("incoterm") else None,
+            f"payment_terms={item.get('payment_terms')}" if item.get("payment_terms") else None,
+            f"quote_date={item.get('quote_date')}" if item.get("quote_date") else None,
+            f"valid_until={item.get('valid_until')}" if item.get("valid_until") else None,
+            f"lead_time_days={item.get('lead_time_days')}" if item.get("lead_time_days") is not None else None,
+            f"missing={','.join(item.get('missing_fields') or [])}" if item.get("missing_fields") else None,
+        ]
+        lines.append("- " + "; ".join(x for x in details if x))
+
+    groups = data.get("comparable_price_groups", [])
+    if groups:
+        lines.append("Comparable saved-price groups:")
+        for group in groups:
+            lines.append(
+                "- "
+                f"currency={group.get('currency')}; "
+                f"unit={group.get('price_unit')}; "
+                f"offer_count={group.get('offer_count')}; "
+                f"lowest_price={group.get('lowest_price')}; "
+                f"offer_ids_by_price={group.get('offer_ids_by_price')}"
+            )
+
+    for warning in data.get("warnings", []):
+        lines.append(f"Warning: {warning}")
+
+    incoterms = sorted({str(x.get("incoterm")).upper() for x in offers if x.get("incoterm")})
+    if len(incoterms) > 1:
+        lines.append(
+            "Warning: matching offers use different Incoterms: "
+            + ", ".join(incoterms)
+            + ". Price alone is not a like-for-like comparison."
+        )
+
+    return "\n".join(lines)
+
+
 async def _persistent_context(user_id: str) -> str:
     profile = await get_profile(user_id)
     memories = await saved_memories(user_id, 20)
@@ -987,6 +1118,7 @@ async def chat(req: ChatRequest):
         f"{m['role']}: {m['content']}" for m in history[:-1]
     )
     persistent_context = await _persistent_context(req.user_id)
+    comparison_context = await _commercial_comparison_context(req.user_id, req.message)
     memory_action_context = (
         f"Internal memory status for this turn: {memory_action}"
         if memory_action
@@ -994,7 +1126,7 @@ async def chat(req: ChatRequest):
     )
     context_text = "\n\n".join(
         part
-        for part in [persistent_context, memory_action_context, recent_context]
+        for part in [persistent_context, comparison_context, memory_action_context, recent_context]
         if part
     )
 
