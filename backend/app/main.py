@@ -33,7 +33,11 @@ from .memory import (
     delete_commercial_offer,
     get_commercial_offer_comparison,
     get_commercial_memory,
+    create_commercial_deal,
+    get_commercial_deals,
+    update_commercial_deal,
 )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1107,6 +1111,172 @@ async def _capture_commercial_management(user_id: str, message: str):
     return None
 
 
+
+_DEAL_STATUS_PATTERNS = [
+    (
+        "waiting_supplier",
+        [
+            r"(?:نحن\s+)?(?:بانتظار|ننتظر)\s+(?:رد\s+)?(?:من\s+)?(?:المورد\s+)?(.+?)[.،,!؟?]*$",
+            r"\b(?:we\s+are\s+)?waiting\s+(?:for\s+)?(?:a\s+)?reply\s+(?:from\s+)?(?:supplier\s+)?(.+?)[.!?]*$",
+            r"\b(?:wir\s+)?warten\s+auf\s+(?:eine\s+)?antwort\s+(?:von\s+)?(?:lieferant\s+)?(.+?)[.!?]*$",
+        ],
+        "supplier",
+        "Wait for supplier reply",
+    ),
+    (
+        "awaiting_sample",
+        [
+            r"(?:نحن\s+)?(?:بانتظار|ننتظر)\s+(?:العينة|عينة)\s+(?:من\s+)?(?:المورد\s+)?(.+?)[.،,!؟?]*$",
+            r"\b(?:we\s+are\s+)?waiting\s+for\s+(?:the\s+)?sample\s+(?:from\s+)?(?:supplier\s+)?(.+?)[.!?]*$",
+            r"\b(?:wir\s+)?warten\s+auf\s+(?:das\s+)?muster\s+(?:von\s+)?(?:lieferant\s+)?(.+?)[.!?]*$",
+        ],
+        "supplier",
+        "Receive and evaluate the supplier sample",
+    ),
+    (
+        "awaiting_pi",
+        [
+            r"(?:نحن\s+)?(?:بانتظار|ننتظر)\s+(?:الـ?\s*)?(?:PI|proforma|الفاتورة\s+(?:المبدئية|الأولية|الاولية))\s+(?:من\s+)?(?:المورد\s+)?(.+?)[.،,!؟?]*$",
+            r"\b(?:we\s+are\s+)?waiting\s+for\s+(?:the\s+)?(?:PI|proforma(?:\s+invoice)?)\s+(?:from\s+)?(?:supplier\s+)?(.+?)[.!?]*$",
+            r"\b(?:wir\s+)?warten\s+auf\s+(?:die\s+)?proforma(?:-rechnung)?\s+(?:von\s+)?(?:lieferant\s+)?(.+?)[.!?]*$",
+        ],
+        "supplier",
+        "Review the proforma invoice when received",
+    ),
+    (
+        "negotiating",
+        [
+            r"(?:نحن\s+)?(?:نتفاوض|في\s+مفاوضات)\s+(?:مع\s+)?(?:المورد\s+)?(.+?)[.،,!؟?]*$",
+            r"\b(?:we\s+are\s+)?negotiating\s+with\s+(?:supplier\s+)?(.+?)[.!?]*$",
+            r"\b(?:wir\s+)?verhandeln\s+mit\s+(?:lieferant\s+)?(.+?)[.!?]*$",
+        ],
+        "supplier",
+        "Continue negotiation and resolve the open commercial points",
+    ),
+    (
+        "production",
+        [
+            r"(?:بدأ|بدأت|دخل|دخلت)\s+(?:المورد\s+)?(.+?)\s+(?:مرحلة\s+)?(?:الإنتاج|الانتاج)[.،,!؟?]*$",
+            r"\b(?:supplier\s+)?(.+?)\s+(?:has\s+)?started\s+production[.!?]*$",
+            r"\b(?:lieferant\s+)?(.+?)\s+hat\s+die\s+produktion\s+begonnen[.!?]*$",
+        ],
+        "supplier",
+        "Monitor production progress and the agreed lead time",
+    ),
+    (
+        "inspection",
+        [
+            r"(?:صفقة|طلب|شحنة)\s+(.+?)\s+(?:في\s+)?(?:مرحلة\s+)?(?:الفحص|التفتيش)[.،,!؟?]*$",
+            r"\b(?:deal|order|shipment)\s+(?:with\s+)?(.+?)\s+is\s+(?:in\s+)?inspection[.!?]*$",
+            r"\b(?:auftrag|sendung)\s+(?:mit\s+)?(.+?)\s+ist\s+in\s+der\s+inspektion[.!?]*$",
+        ],
+        "inspection",
+        "Complete inspection and record the result",
+    ),
+    (
+        "ready_to_ship",
+        [
+            r"(?:المورد\s+)?(.+?)\s+(?:جاهز|جاهزة)\s+للشحن[.،,!؟?]*$",
+            r"\b(?:supplier\s+)?(.+?)\s+is\s+ready\s+to\s+ship[.!?]*$",
+            r"\b(?:lieferant\s+)?(.+?)\s+ist\s+versandbereit[.!?]*$",
+        ],
+        "supplier",
+        "Confirm shipping documents and shipment release",
+    ),
+    (
+        "completed",
+        [
+            r"(?:اكتملت|انتهت|أغلق|اغلق)\s+(?:الصفقة\s+)?(?:مع\s+)?(?:المورد\s+)?(.+?)[.،,!؟?]*$",
+            r"\b(?:the\s+deal\s+with\s+)?(?:supplier\s+)?(.+?)\s+is\s+completed[.!?]*$",
+            r"\b(?:der\s+deal\s+mit\s+)?(?:lieferant\s+)?(.+?)\s+ist\s+abgeschlossen[.!?]*$",
+        ],
+        "none",
+        "No further action",
+    ),
+]
+
+
+def _extract_deal_tracking_status(message: str):
+    for status, patterns, waiting_on, next_action in _DEAL_STATUS_PATTERNS:
+        for pattern in patterns:
+            match = re.search(pattern, message, flags=re.IGNORECASE)
+            if not match:
+                continue
+            supplier_query = _clean_value(match.group(1))
+            if supplier_query:
+                return {
+                    "status": status,
+                    "supplier_query": supplier_query,
+                    "waiting_on": waiting_on,
+                    "next_action": next_action,
+                }
+    return None
+
+
+async def _capture_deal_tracking(user_id: str, message: str):
+    command = _extract_deal_tracking_status(message)
+    if not command:
+        return None
+
+    supplier, error = await _resolve_management_supplier(
+        user_id, command["supplier_query"]
+    )
+    if error:
+        return error.replace("Commercial management", "Deal tracking")
+
+    active_deals = await get_commercial_deals(
+        user_id,
+        active_only=True,
+        supplier_id=supplier["id"],
+        limit=10,
+    )
+    status = command["status"]
+
+    if active_deals:
+        deal = active_deals[0]
+        await update_commercial_deal(
+            user_id,
+            deal["id"],
+            status=status,
+            waiting_on=command["waiting_on"],
+            next_action=command["next_action"],
+        )
+        return (
+            f"Deal tracking updated: deal_id={deal['id']}; "
+            f"supplier={supplier['name']}; status={status}; "
+            f"waiting_on={command['waiting_on']}; "
+            f"next_action={command['next_action']}"
+        )
+
+    if status in {"completed", "cancelled"}:
+        return (
+            "Deal tracking not applied: no active deal exists for "
+            f"supplier {supplier['name']}."
+        )
+
+    latest = await get_latest_commercial_offer(user_id, supplier["id"])
+    deal_id = await create_commercial_deal(
+        user_id,
+        supplier_id=supplier["id"],
+        product_id=latest.get("product_id") if latest else None,
+        offer_id=latest.get("id") if latest else None,
+        title=(
+            f"{latest.get('product')} - {supplier['name']}"
+            if latest and latest.get("product")
+            else f"Deal with {supplier['name']}"
+        ),
+        status=status,
+        waiting_on=command["waiting_on"],
+        next_action=command["next_action"],
+    )
+    return (
+        f"Deal tracking created: deal_id={deal_id}; "
+        f"supplier={supplier['name']}; status={status}; "
+        f"waiting_on={command['waiting_on']}; "
+        f"next_action={command['next_action']}"
+    )
+
+
 async def _capture_user_memory(user_id: str, message: str):
     control = _extract_memory_control(message)
     if control:
@@ -1119,6 +1289,10 @@ async def _capture_user_memory(user_id: str, message: str):
     management_action = await _capture_commercial_management(user_id, message)
     if management_action:
         return management_action
+
+    deal_action = await _capture_deal_tracking(user_id, message)
+    if deal_action:
+        return deal_action
 
     commercial_action = await _capture_commercial_memory(user_id, message)
 
@@ -1270,6 +1444,7 @@ async def _persistent_context(user_id: str) -> str:
     memories = await saved_memories(user_id, 20)
     smart = await get_smart_memories(user_id, 30)
     commercial = await get_commercial_memory(user_id, supplier_limit=10, offer_limit=20)
+    deals = await get_commercial_deals(user_id, active_only=True, limit=30)
     supplier_ids = [item["id"] for item in commercial.get("suppliers", [])]
     commercial_languages = await get_commercial_supplier_languages(user_id, supplier_ids)
 
@@ -1292,6 +1467,21 @@ async def _persistent_context(user_id: str) -> str:
 
     suppliers = commercial.get("suppliers", [])
     offers = commercial.get("offers", [])
+
+    if deals:
+        lines.append("Active commercial deal tracking:")
+        for deal in deals:
+            details = [
+                f"deal_id={deal.get('id')}",
+                f"supplier={deal.get('supplier')}",
+                f"product={deal.get('product')}" if deal.get("product") else None,
+                f"offer_id={deal.get('offer_id')}" if deal.get("offer_id") else None,
+                f"status={deal.get('status')}",
+                f"waiting_on={deal.get('waiting_on')}" if deal.get("waiting_on") else None,
+                f"next_action={deal.get('next_action')}" if deal.get("next_action") else None,
+                f"next_action_due={deal.get('next_action_due')}" if deal.get("next_action_due") else None,
+            ]
+            lines.append("- " + "; ".join(item for item in details if item))
 
     if suppliers:
         lines.append("Commercial supplier memory:")
