@@ -947,6 +947,8 @@ async def _commercial_comparison_context(user_id: str, message: str) -> str:
         "Do not compare prices across different currencies or price units unless the user explicitly asks for conversion and a reliable conversion is separately available.",
         "A lowest price means lowest only inside the same currency + price-unit group.",
         "Different Incoterms are not directly equivalent; mention that when relevant.",
+        "Do not describe one Incoterm as inherently better than another. EXW, FOB, CIF, DDP and others allocate cost, risk, transport and customs responsibilities differently.",
+        "When Incoterms differ, do not treat the quoted prices as a like-for-like total-cost comparison. State what each term includes and say that landed or equivalent-basis cost is needed for a definitive price winner.",
         "Do not call a supplier 'best overall' solely because its saved price is lower. Consider thickness, Incoterm, MOQ, payment terms, lead time, quote date/validity, and missing data when those fields exist.",
         "Historical offers remain saved; this snapshot shows the latest matching saved offer per supplier.",
     ]
