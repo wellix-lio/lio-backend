@@ -39,6 +39,7 @@ from .memory import (
     get_commercial_memory,
     create_commercial_deal,
     get_commercial_deals,
+    get_commercial_deal_events,
     add_commercial_deal_event,
     get_commercial_deal_by_id,
     update_commercial_deal,
@@ -1777,6 +1778,487 @@ def _commercial_clarification_resolution_text(plan: dict | None, result: dict | 
     return "|".join(parts)
 
 
+
+
+def _negotiation_cycle_clean_value(value):
+    if value in (None, ""):
+        return None
+    return str(value).strip().replace("|", "/").replace(";", ",")
+
+
+def _negotiation_cycle_offer_matches(current: dict, candidate: dict) -> bool:
+    if current.get("supplier_id") != candidate.get("supplier_id"):
+        return False
+
+    current_product = (current.get("product") or "").strip().casefold()
+    candidate_product = (candidate.get("product") or "").strip().casefold()
+    current_size = (current.get("size") or "").strip().casefold()
+    candidate_size = (candidate.get("size") or "").strip().casefold()
+
+    product_ok = (
+        not current_product
+        or not candidate_product
+        or current_product == candidate_product
+    )
+    size_ok = (
+        not current_size
+        or not candidate_size
+        or current_size == candidate_size
+    )
+    return product_ok and size_ok
+
+
+def _negotiation_cycle_term_changes(current: dict, previous: dict | None):
+    if not previous:
+        return []
+
+    fields = (
+        "price", "currency", "price_unit", "incoterm", "quantity", "moq",
+        "payment_terms", "lead_time_days", "valid_until",
+        "product", "size", "thickness_mm",
+    )
+
+    changes = []
+    for field in fields:
+        old = previous.get(field)
+        new = current.get(field)
+        if _clarification_values_equal(old, new):
+            continue
+
+        if old in (None, "") and new not in (None, ""):
+            kind = "added"
+        elif old not in (None, "") and new in (None, ""):
+            kind = "missing_now"
+        else:
+            kind = "changed"
+
+        changes.append({
+            "field": field,
+            "kind": kind,
+            "from": old,
+            "to": new,
+        })
+
+    return changes
+
+
+async def _commercial_negotiation_cycle_snapshot(
+    user_id: str,
+    deal: dict,
+    newest_offer_id: int | None = None,
+):
+    supplier_id = deal.get("supplier_id")
+    if supplier_id is None:
+        return None
+
+    data = await get_commercial_offer_comparison(
+        user_id,
+        supplier_ids=[int(supplier_id)],
+        latest_per_supplier=False,
+        limit=100,
+    )
+    offers = data.get("offers", [])
+    if not offers:
+        return None
+
+    current = None
+    if newest_offer_id is not None:
+        current = next(
+            (item for item in offers if item.get("id") == newest_offer_id),
+            None,
+        )
+
+    if current is None:
+        # Clarification-resolution snapshots refine an already saved commercial
+        # offer; they are not counted as new negotiation price rounds.
+        current = next(
+            (
+                item for item in offers
+                if str(item.get("source") or "") != "clarification_resolution"
+            ),
+            offers[0],
+        )
+
+    negotiation_offers = [
+        item for item in offers
+        if str(item.get("source") or "") != "clarification_resolution"
+        and _negotiation_cycle_offer_matches(current, item)
+    ]
+    negotiation_offers = sorted(
+        negotiation_offers,
+        key=lambda item: int(item.get("id") or 0),
+    )
+
+    if str(current.get("source") or "") == "clarification_resolution":
+        # Clarification snapshots refine a saved offer. Reuse the existing
+        # clarification-chain-aware selector so comparison goes back to the
+        # prior real commercial offer.
+        previous = _offer_decision_pick_previous(offers, current)
+    else:
+        # For a normal negotiation round, never let a later clarification
+        # snapshot or later offer become its "previous" offer.
+        current_id = int(current.get("id") or 0)
+        earlier_negotiation_offers = [
+            item for item in negotiation_offers
+            if int(item.get("id") or 0) < current_id
+        ]
+        previous = (
+            earlier_negotiation_offers[-1]
+            if earlier_negotiation_offers
+            else None
+        )
+
+    round_number = None
+    for index, item in enumerate(negotiation_offers, start=1):
+        if item.get("id") == current.get("id"):
+            round_number = index
+            break
+    if round_number is None:
+        round_number = max(1, len(negotiation_offers))
+
+    price_change = None
+    price_change_pct = None
+    price_trend = "not_comparable"
+
+    if previous:
+        currency_same = _offer_decision_same_text(
+            current.get("currency"), previous.get("currency")
+        )
+        unit_same = _offer_decision_same_text(
+            current.get("price_unit"), previous.get("price_unit")
+        )
+        incoterm_same = _offer_decision_same_text(
+            current.get("incoterm"), previous.get("incoterm")
+        )
+
+        if (
+            currency_same is True
+            and unit_same is True
+            and incoterm_same is True
+            and current.get("price") is not None
+            and previous.get("price") is not None
+        ):
+            try:
+                price_change = float(current["price"]) - float(previous["price"])
+                if float(previous["price"]) != 0:
+                    price_change_pct = (
+                        price_change / float(previous["price"])
+                    ) * 100.0
+
+                if price_change < -1e-9:
+                    price_trend = "improved"
+                elif price_change > 1e-9:
+                    price_trend = "worsened"
+                else:
+                    price_trend = "unchanged"
+            except (TypeError, ValueError):
+                price_change = None
+                price_change_pct = None
+                price_trend = "not_comparable"
+    else:
+        price_trend = "baseline"
+
+    guidance = await _commercial_offer_decision_guidance(
+        user_id,
+        supplier_id=int(supplier_id),
+        newest_offer_id=current.get("id"),
+    )
+
+    events = await get_commercial_deal_events(
+        user_id,
+        int(deal["id"]),
+        limit=200,
+    )
+    recorded_rounds = [
+        event for event in events
+        if event.get("event_type") == "negotiation_round_recorded"
+    ]
+
+    return {
+        "deal_id": deal.get("id"),
+        "supplier_id": supplier_id,
+        "supplier": deal.get("supplier"),
+        "round_number": round_number,
+        "recorded_round_count": len(recorded_rounds),
+        "current_offer_id": current.get("id"),
+        "previous_offer_id": previous.get("id") if previous else None,
+        "price": current.get("price"),
+        "currency": current.get("currency"),
+        "price_unit": current.get("price_unit"),
+        "incoterm": current.get("incoterm"),
+        "price_change": price_change,
+        "price_change_pct": price_change_pct,
+        "price_trend": price_trend,
+        "term_changes": _negotiation_cycle_term_changes(current, previous),
+        "guidance": guidance,
+    }
+
+
+def _commercial_negotiation_cycle_text(snapshot: dict | None):
+    if not snapshot:
+        return None
+
+    parts = [
+        f"deal_id={snapshot.get('deal_id')}",
+        f"round={snapshot.get('round_number')}",
+        f"offer_id={snapshot.get('current_offer_id')}",
+        f"price_trend={snapshot.get('price_trend')}",
+    ]
+
+    if snapshot.get("previous_offer_id") is not None:
+        parts.append(f"previous_offer_id={snapshot.get('previous_offer_id')}")
+    if snapshot.get("price") is not None:
+        parts.append(f"price={snapshot.get('price')}")
+    if snapshot.get("currency"):
+        parts.append(f"currency={snapshot.get('currency')}")
+    if snapshot.get("price_unit"):
+        parts.append(f"price_unit={snapshot.get('price_unit')}")
+    if snapshot.get("incoterm"):
+        parts.append(f"incoterm={snapshot.get('incoterm')}")
+    if snapshot.get("price_change") is not None:
+        parts.append(f"price_change={snapshot.get('price_change'):.6g}")
+    if snapshot.get("price_change_pct") is not None:
+        parts.append(
+            f"price_change_pct={snapshot.get('price_change_pct'):.4g}"
+        )
+
+    changes = snapshot.get("term_changes") or []
+    if changes:
+        encoded = []
+        for change in changes:
+            field = change.get("field")
+            kind = change.get("kind")
+            old = _negotiation_cycle_clean_value(change.get("from"))
+            new = _negotiation_cycle_clean_value(change.get("to"))
+            encoded.append(
+                f"{field}:{kind}:{old if old is not None else 'none'}"
+                f"->{new if new is not None else 'none'}"
+            )
+        parts.append("changes=" + ",".join(encoded))
+    else:
+        parts.append("changes=none")
+
+    guidance = snapshot.get("guidance") or {}
+    if guidance.get("decision"):
+        parts.append(f"recommendation={guidance.get('decision')}")
+    if guidance.get("confidence"):
+        parts.append(f"confidence={guidance.get('confidence')}")
+
+    return "|".join(parts)
+
+
+async def _record_commercial_negotiation_round(
+    user_id: str,
+    deal: dict,
+    newest_offer_id: int,
+):
+    events = await get_commercial_deal_events(
+        user_id,
+        int(deal["id"]),
+        limit=200,
+    )
+    offer_marker = f"offer_id={int(newest_offer_id)}"
+
+    for event in events:
+        if (
+            event.get("event_type") == "negotiation_round_recorded"
+            and offer_marker in str(event.get("summary") or "")
+        ):
+            snapshot = await _commercial_negotiation_cycle_snapshot(
+                user_id,
+                deal,
+                newest_offer_id=int(newest_offer_id),
+            )
+            return {
+                "snapshot": snapshot,
+                "event_created": False,
+            }
+
+    snapshot = await _commercial_negotiation_cycle_snapshot(
+        user_id,
+        deal,
+        newest_offer_id=int(newest_offer_id),
+    )
+    if not snapshot:
+        return None
+
+    summary = _commercial_negotiation_cycle_text(snapshot)
+    await add_commercial_deal_event(
+        user_id,
+        int(deal["id"]),
+        "negotiation_round_recorded",
+        summary,
+        source="system",
+    )
+    return {
+        "snapshot": snapshot,
+        "event_created": True,
+    }
+
+
+def _is_negotiation_cycle_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "negotiation history", "negotiation cycle", "negotiation rounds",
+        "summarize negotiation", "negotiation summary", "how has the negotiation",
+        "price rounds", "offer rounds",
+        "verhandlungsverlauf", "verhandlungsrunden", "verhandlung zusammenfassen",
+        "جولات التفاوض", "دورة التفاوض", "تاريخ التفاوض", "ملخص التفاوض",
+        "لخص التفاوض", "لخّص التفاوض", "كيف تطور التفاوض", "تطور السعر",
+    )
+    commercial = (
+        "deal", "supplier", "offer", "price", "negotiat",
+        "صفقة", "مورد", "عرض", "سعر", "تفاوض",
+        "lieferant", "angebot", "preis", "verhandlung",
+    )
+    return any(signal in folded for signal in signals) and any(
+        signal in folded for signal in commercial
+    )
+
+
+async def _commercial_negotiation_cycle_context(
+    user_id: str,
+    message: str,
+) -> str:
+    if not _is_negotiation_cycle_request(message):
+        return ""
+
+    deal_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        _deal_followup_ascii_digits(message or ""),
+        flags=re.IGNORECASE,
+    )
+
+    deal = None
+    if deal_match:
+        deal = await get_commercial_deal_by_id(
+            user_id,
+            int(deal_match.group(1)),
+        )
+    else:
+        deals = await get_commercial_deals(
+            user_id,
+            active_only=True,
+            limit=20,
+        )
+        if len(deals) == 1:
+            deal = deals[0]
+
+    if not deal:
+        return (
+            "SMART NEGOTIATION CYCLE.\n"
+            "No unique active deal could be resolved. Ask for the deal ID.\n"
+            "Do not invent a target price, concession, commitment, or supplier statement."
+        )
+
+    data = await get_commercial_offer_comparison(
+        user_id,
+        supplier_ids=[int(deal["supplier_id"])],
+        latest_per_supplier=False,
+        limit=100,
+    )
+    offers = [
+        item for item in data.get("offers", [])
+        if str(item.get("source") or "") != "clarification_resolution"
+    ]
+    offers = [
+        item for item in offers
+        if not deal.get("product_id")
+        or item.get("product_id") == deal.get("product_id")
+        or _negotiation_cycle_offer_matches(
+            {
+                "supplier_id": deal.get("supplier_id"),
+                "product": deal.get("product"),
+                "size": deal.get("size"),
+            },
+            item,
+        )
+    ]
+    offers = sorted(
+        offers,
+        key=lambda item: int(item.get("id") or 0),
+    )
+
+    events = await get_commercial_deal_events(
+        user_id,
+        int(deal["id"]),
+        limit=200,
+    )
+    round_events = [
+        event for event in events
+        if event.get("event_type") == "negotiation_round_recorded"
+    ]
+
+    latest_snapshot = await _commercial_negotiation_cycle_snapshot(
+        user_id,
+        deal,
+        newest_offer_id=(offers[-1].get("id") if offers else None),
+    )
+
+    lines = [
+        "SMART NEGOTIATION CYCLE.",
+        "Read-only negotiation history. Do not send, accept, reject, save, close, or change the deal automatically.",
+        "Use only saved commercial facts. Never invent a target price, competitor quote, concession, deadline, or volume commitment.",
+        f"Deal ID: {deal.get('id')}",
+        f"Supplier: {deal.get('supplier')}",
+        f"Recorded negotiation round events: {len(round_events)}",
+    ]
+
+    previous = None
+    for index, offer in enumerate(offers, start=1):
+        details = [
+            f"round={index}",
+            f"offer_id={offer.get('id')}",
+            f"price={offer.get('price')}" if offer.get("price") is not None else None,
+            f"currency={offer.get('currency')}" if offer.get("currency") else None,
+            f"unit={offer.get('price_unit')}" if offer.get("price_unit") else None,
+            f"incoterm={offer.get('incoterm')}" if offer.get("incoterm") else None,
+            f"moq={offer.get('moq')}" if offer.get("moq") is not None else None,
+            f"payment_terms={offer.get('payment_terms')}" if offer.get("payment_terms") else None,
+            f"lead_time_days={offer.get('lead_time_days')}" if offer.get("lead_time_days") is not None else None,
+            f"valid_until={offer.get('valid_until')}" if offer.get("valid_until") else None,
+        ]
+
+        if previous:
+            same_currency = _offer_decision_same_text(
+                offer.get("currency"), previous.get("currency")
+            )
+            same_unit = _offer_decision_same_text(
+                offer.get("price_unit"), previous.get("price_unit")
+            )
+            same_incoterm = _offer_decision_same_text(
+                offer.get("incoterm"), previous.get("incoterm")
+            )
+            if (
+                same_currency is True
+                and same_unit is True
+                and same_incoterm is True
+                and offer.get("price") is not None
+                and previous.get("price") is not None
+            ):
+                delta = float(offer["price"]) - float(previous["price"])
+                details.append(f"price_delta_from_prior={delta:.6g}")
+
+        lines.append("- " + "; ".join(x for x in details if x))
+        previous = offer
+
+    if latest_snapshot:
+        guidance = latest_snapshot.get("guidance") or {}
+        lines.append(
+            f"Latest price trend: {latest_snapshot.get('price_trend')}"
+        )
+        if guidance.get("decision"):
+            lines.append(
+                f"Latest advisory recommendation: {guidance.get('decision')}"
+            )
+        if guidance.get("reason"):
+            lines.append(
+                "Latest recommendation reason: " + str(guidance.get("reason"))
+            )
+
+    return "\n".join(lines)
+
+
 async def _capture_supplier_reply_handoff(user_id: str, message: str):
     request = _extract_supplier_reply_handoff_request(message)
     if not request:
@@ -1858,6 +2340,7 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
     commercial_save_status = None
     decision_guidance_status = None
     clarification_resolution_status = None
+    negotiation_cycle_status = None
 
     clarification_plan = await _commercial_clarification_resolution_plan(
         user_id, deal, message
@@ -1923,6 +2406,26 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
                 )
                 decision_guidance_status = _commercial_offer_decision_guidance_text(guidance)
 
+        if (
+            commercial_save_status
+            and commercial_save_status.startswith("Commercial memory saved:")
+            and clarification_result is None
+        ):
+            negotiation_offer_match = re.search(
+                r"offer_id=(\d+)",
+                commercial_save_status,
+            )
+            if negotiation_offer_match:
+                negotiation_result = await _record_commercial_negotiation_round(
+                    user_id,
+                    deal,
+                    int(negotiation_offer_match.group(1)),
+                )
+                if negotiation_result:
+                    negotiation_cycle_status = _commercial_negotiation_cycle_text(
+                        negotiation_result.get("snapshot")
+                    )
+
     parts = [
         f"Supplier reply handoff recorded: deal_id={deal['id']}",
         f"supplier={deal.get('supplier')}",
@@ -1938,6 +2441,8 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
         parts.append(f"commercial_save_status={commercial_save_status}")
         if clarification_resolution_status:
             parts.append(f"clarification_resolution={clarification_resolution_status}")
+        if negotiation_cycle_status:
+            parts.append(f"negotiation_cycle={negotiation_cycle_status}")
         if decision_guidance_status:
             parts.append(f"decision_guidance={decision_guidance_status}")
     else:
@@ -3179,6 +3684,35 @@ def _authoritative_memory_action_reply(memory_action: str | None):
                 "Commercial terms from the reply were not saved because you did not explicitly request that."
             )
 
+        negotiation_marker = "negotiation_cycle="
+        if negotiation_marker in memory_action:
+            raw_negotiation = memory_action.split(negotiation_marker, 1)[1]
+            raw_negotiation = raw_negotiation.split(
+                "; decision_guidance=", 1
+            )[0].rstrip(".")
+
+            negotiation_values = {}
+            for token in raw_negotiation.split("|"):
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    negotiation_values[key] = value
+
+            round_value = negotiation_values.get("round")
+            offer_value = negotiation_values.get("offer_id")
+            trend_value = negotiation_values.get("price_trend")
+            previous_value = negotiation_values.get("previous_offer_id")
+
+            if round_value and offer_value:
+                text = (
+                    f"Negotiation round {round_value} recorded for saved offer ID: "
+                    f"{offer_value}."
+                )
+                if previous_value:
+                    text += f" Previous comparable offer ID: {previous_value}."
+                if trend_value:
+                    text += f" Saved price trend: {trend_value}."
+                parts.append(text)
+
         clarification_marker = "clarification_resolution="
         if clarification_marker in memory_action:
             raw_clarification = memory_action.split(clarification_marker, 1)[1]
@@ -3317,6 +3851,9 @@ async def chat(req: ChatRequest):
     decision_action_handoff_context = await _commercial_offer_decision_action_handoff_context(
         req.user_id, req.message
     )
+    negotiation_cycle_context = await _commercial_negotiation_cycle_context(
+        req.user_id, req.message
+    )
     memory_action_context = (
         f"Internal memory status for this turn: {memory_action}"
         if memory_action
@@ -3329,6 +3866,7 @@ async def chat(req: ChatRequest):
             comparison_context,
             decision_guidance_context,
             decision_action_handoff_context,
+            negotiation_cycle_context,
             memory_action_context,
             recent_context,
         ]
