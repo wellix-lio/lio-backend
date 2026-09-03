@@ -3056,6 +3056,178 @@ async def _capture_acceptance_and_closing_guardrails(user_id: str, message: str)
         "No supplier message was sent. Next step: order / execution handoff."
     )
 
+
+
+def _is_explicit_order_execution_handoff_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "start order handoff",
+        "start the order handoff",
+        "proceed to order handoff",
+        "proceed with order handoff",
+        "start order execution",
+        "start the order execution",
+        "proceed to order execution",
+        "proceed with order execution",
+        "begin order execution",
+        "begin the order execution",
+        "move to awaiting pi",
+        "move the deal to awaiting pi",
+        "start awaiting pi",
+        "ابدأ تسليم الطلب للتنفيذ",
+        "ابدأ تحويل الطلب للتنفيذ",
+        "ابدأ تنفيذ الطلب",
+        "ابدأ مرحلة التنفيذ",
+        "انتقل إلى تنفيذ الطلب",
+        "انتقل الى تنفيذ الطلب",
+        "انتقل إلى انتظار الفاتورة المبدئية",
+        "انتقل الى انتظار الفاتورة المبدئية",
+        "starte die bestellübergabe",
+        "starte die bestelluebergabe",
+        "mit der bestellabwicklung beginnen",
+        "bestellabwicklung starten",
+        "zur auftragsausführung übergehen",
+        "zur auftragsausfuehrung uebergehen",
+    )
+    return any(x in folded for x in signals)
+
+
+async def _has_order_execution_handoff_event(user_id: str, deal_id: int) -> bool:
+    events = await get_commercial_deal_events(user_id, int(deal_id), limit=200)
+    return any(
+        event.get("event_type") == "order_execution_handoff_started"
+        for event in events
+    )
+
+
+async def _capture_order_execution_handoff(user_id: str, message: str):
+    if not _is_explicit_order_execution_handoff_request(message):
+        return None
+
+    deal_id = _acceptance_guard_deal_id(message)
+    if deal_id is None:
+        return (
+            "Order execution handoff guardrail: handoff not started. "
+            "Specify the deal ID explicitly, for example "
+            "'Start order execution for deal #5'."
+        )
+
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        return (
+            "Order execution handoff guardrail: handoff not started because "
+            f"deal #{deal_id} was not found."
+        )
+
+    if not deal.get("is_active"):
+        return (
+            "Order execution handoff guardrail: handoff not started because "
+            f"deal #{deal_id} is inactive/closed."
+        )
+
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return (
+            "Order execution handoff guardrail: handoff not started because "
+            "the deal does not point to a saved current offer."
+        )
+
+    if not await _has_current_offer_acceptance_event(user_id, deal):
+        return (
+            "Order execution handoff guardrail: handoff blocked. "
+            f"Current offer ID {offer_id} does not have an explicit recorded acceptance. "
+            "Accept the current offer explicitly first."
+        )
+
+    if await _has_order_execution_handoff_event(user_id, int(deal_id)):
+        return (
+            "Order execution handoff guardrail: order / execution handoff "
+            f"is already started for deal #{deal_id}; current status={deal.get('status')}. "
+            "No duplicate handoff event was created."
+        )
+
+    changed = await update_commercial_deal(
+        user_id,
+        int(deal_id),
+        status="awaiting_pi",
+        waiting_on="supplier",
+        next_action="Receive and review the supplier proforma invoice",
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return (
+            "Order execution handoff guardrail: handoff could not be started "
+            "because the deal update failed."
+        )
+
+    await add_commercial_deal_event(
+        user_id,
+        int(deal_id),
+        "order_execution_handoff_started",
+        (
+            f"Order / execution handoff started explicitly by user; "
+            f"offer_id={int(offer_id)}; status=awaiting_pi; "
+            "waiting_on=supplier; next_action=Receive and review the supplier proforma invoice"
+        ),
+        source="user",
+    )
+
+    return (
+        "Order execution handoff guardrail: order / execution handoff started internally; "
+        f"deal_id={deal_id}; offer_id={offer_id}; status=awaiting_pi. "
+        "Waiting on the supplier proforma invoice (PI). "
+        "No purchase order, supplier message, payment, shipment release, or other external action was executed."
+    )
+
+
+async def _execution_stage_transition_allowed(user_id: str, deal: dict, target_status: str):
+    execution_statuses = {"awaiting_pi", "production", "inspection", "ready_to_ship"}
+    if target_status not in execution_statuses:
+        return True, None
+
+    if target_status == "awaiting_pi":
+        return False, (
+            "Execution-stage guardrail: awaiting_pi must be entered through the explicit "
+            "order / execution handoff after the current offer has an explicit recorded acceptance."
+        )
+
+    if not await _has_order_execution_handoff_event(user_id, int(deal["id"])):
+        return False, (
+            "Execution-stage guardrail: execution stage change blocked because the "
+            "order / execution handoff has not been started explicitly."
+        )
+
+    order = {
+        "awaiting_pi": 0,
+        "production": 1,
+        "inspection": 2,
+        "ready_to_ship": 3,
+    }
+    current_status = str(deal.get("status") or "")
+    if current_status not in order:
+        return False, (
+            "Execution-stage guardrail: execution stage change blocked because the "
+            f"current deal status is {current_status or 'unknown'}, not an active execution stage."
+        )
+
+    current_rank = order[current_status]
+    target_rank = order[target_status]
+
+    if target_rank > current_rank + 1:
+        return False, (
+            "Execution-stage guardrail: stage jump blocked. "
+            f"Current status={current_status}; requested status={target_status}. "
+            "Record the intermediate execution stage first."
+        )
+
+    if target_rank < current_rank:
+        return False, (
+            "Execution-stage guardrail: backward execution-stage change blocked. "
+            f"Current status={current_status}; requested status={target_status}."
+        )
+
+    return True, None
+
 async def _capture_deal_tracking(user_id: str, message: str):
     command = _extract_deal_tracking_status(message)
     if not command:
@@ -3085,6 +3257,15 @@ async def _capture_deal_tracking(user_id: str, message: str):
 
     if active_deals:
         deal = active_deals[0]
+
+        execution_allowed, execution_error = await _execution_stage_transition_allowed(
+            user_id,
+            deal,
+            status,
+        )
+        if not execution_allowed:
+            return execution_error
+
         await update_commercial_deal(
             user_id,
             deal["id"],
@@ -3158,6 +3339,12 @@ async def _capture_user_memory(user_id: str, message: str):
     )
     if acceptance_closing_action:
         return acceptance_closing_action
+
+    order_execution_action = await _capture_order_execution_handoff(
+        user_id, message
+    )
+    if order_execution_action:
+        return order_execution_action
 
     deal_action = await _capture_deal_tracking(user_id, message)
     if deal_action:
@@ -4121,6 +4308,12 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("Deal closing guardrail:"):
         return memory_action.split("Deal closing guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Order execution handoff guardrail:"):
+        return memory_action.split("Order execution handoff guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Execution-stage guardrail:"):
+        return memory_action.split("Execution-stage guardrail:", 1)[1].strip()
 
     if memory_action.startswith("Commercial memory saved:"):
         details = memory_action.split("Commercial memory saved:", 1)[1].strip()
