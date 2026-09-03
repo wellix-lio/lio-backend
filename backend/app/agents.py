@@ -1,4 +1,5 @@
 from agents import Agent, Runner, WebSearchTool
+from pydantic import BaseModel
 from datetime import datetime, timezone
 from .config import OPENAI_DEFAULT_MODEL
 
@@ -97,10 +98,101 @@ Return concise findings and identify the source or sources used.
     tools=[WebSearchTool()],
 )
 
+PI_REVIEW_RULES = """
+PI review and verification guardrails:
+- Treat a supplier proforma invoice (PI) as evidence to review, not as authorization to approve, pay, send, place an order, start production, or create any external commitment.
+- Extract only facts actually visible in the submitted PI or supplied PI text. Never fill a missing PI field from the saved offer, conversation history, market knowledge, or assumptions.
+- Preserve numbers, currencies, units, product specifications, Incoterms, payment terms, dates, quantities, PI numbers, and supplier identity exactly enough for reliable comparison.
+- If a field is absent, unclear, unreadable, or ambiguous, return it as null rather than guessing.
+- document_is_pi must be true only when the supplied document/text is genuinely a proforma invoice or clearly presented as one.
+- PI extraction is factual only. Do not decide whether payment should be made and do not interpret a matching PI as user approval.
+"""
+
+class PIReviewExtraction(BaseModel):
+    document_is_pi: bool
+    pi_number: str | None
+    pi_date: str | None
+    valid_until: str | None
+    supplier: str | None
+    product: str | None
+    size: str | None
+    thickness_mm: float | None
+    quantity: float | None
+    unit_price: float | None
+    currency: str | None
+    price_unit: str | None
+    incoterm: str | None
+    payment_terms: str | None
+    lead_time_days: int | None
+    total_amount: float | None
+    loading_port: str | None
+    packing: str | None
+    extraction_notes: str | None
+
+
+pi_review_agent = Agent(
+    name="Lio PI Review",
+    model=OPENAI_DEFAULT_MODEL,
+    instructions=BASE_RULES + PI_REVIEW_RULES,
+    output_type=PIReviewExtraction,
+)
+
+
+async def run_pi_review_file(
+    file_data_url: str,
+    filename: str,
+    mime_type: str,
+) -> PIReviewExtraction:
+    instruction = (
+        "Extract the factual contents of this supplier proforma invoice. "
+        "Do not use outside context to fill missing fields. Return null for anything "
+        "not explicitly present or not reliably readable."
+    )
+    if (mime_type or "").lower().startswith("image/"):
+        content = [
+            {"type": "input_text", "text": instruction},
+            {"type": "input_image", "image_url": file_data_url, "detail": "high"},
+        ]
+    else:
+        content = [
+            {"type": "input_text", "text": instruction},
+            {
+                "type": "input_file",
+                "file_data": file_data_url,
+                "filename": filename,
+                "detail": "high",
+            },
+        ]
+
+    result = await Runner.run(
+        pi_review_agent,
+        [{"role": "user", "content": content}],
+    )
+    output = result.final_output
+    if isinstance(output, PIReviewExtraction):
+        return output
+    return PIReviewExtraction.model_validate(output)
+
+
+async def run_pi_review_text(text: str) -> PIReviewExtraction:
+    result = await Runner.run(
+        pi_review_agent,
+        (
+            "Extract the factual contents of the supplier PI/proforma invoice text below. "
+            "Do not use outside context to fill missing fields. Return null for anything "
+            "not explicitly present or not reliably stated.\n\nPI text:\n" + text
+        ),
+    )
+    output = result.final_output
+    if isinstance(output, PIReviewExtraction):
+        return output
+    return PIReviewExtraction.model_validate(output)
+
+
 business_agent = Agent(
     name="Lio Business",
     model=OPENAI_DEFAULT_MODEL,
-    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + SUPPLIER_FOLLOWUP_DRAFTING_RULES + """
+    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + SUPPLIER_FOLLOWUP_DRAFTING_RULES + PI_REVIEW_RULES + """
 You specialize in commercial tasks: suppliers, offers, procurement, pricing,
 logistics, negotiation preparation, market comparison, and business analysis.
 
@@ -181,6 +273,7 @@ Smart offer comparison and decision guidance:
         tool_description="Research current suppliers, companies, markets, prices, and business facts."
     )],
 )
+
 
 communication_agent = Agent(
     name="Lio Communication",

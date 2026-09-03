@@ -1,7 +1,11 @@
+import base64
+import hashlib
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -3309,6 +3313,227 @@ async def _capture_deal_tracking(user_id: str, message: str):
     )
 
 
+
+def _is_pi_review_text_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "review pi", "review the pi", "check pi", "check the pi", "verify pi", "verify the pi",
+        "pi received", "received the pi", "received pi", "supplier sent the pi", "supplier sent pi",
+        "proforma invoice received", "received the proforma invoice", "review proforma invoice",
+        "check proforma invoice", "verify proforma invoice",
+        "راجع pi", "راجع الـ pi", "راجع ال pi", "راجع الفاتورة المبدئية", "راجع الفاتورة الأولية",
+        "استلمنا pi", "استلمت pi", "وصل pi", "وصلت الفاتورة المبدئية", "وصلت الفاتورة الأولية",
+        "راجع proforma", "pi prüfen", "pi pruefen", "proforma-rechnung prüfen", "proforma-rechnung pruefen",
+        "proforma rechnung prüfen", "proforma rechnung pruefen",
+    )
+    return any(signal in folded for signal in signals)
+
+
+def _pi_normalize_text(value):
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w.%/+ -]+", "", text, flags=re.UNICODE)
+    return text or None
+
+
+def _pi_values_equal(saved, pi_value, *, numeric: bool = False) -> bool:
+    if saved is None or pi_value is None:
+        return False
+    if numeric:
+        try:
+            left = float(saved)
+            right = float(pi_value)
+            tolerance = max(1e-6, abs(left) * 1e-6)
+            return abs(left - right) <= tolerance
+        except (TypeError, ValueError):
+            pass
+    return _pi_normalize_text(saved) == _pi_normalize_text(pi_value)
+
+
+def _compare_pi_to_offer(offer: dict, pi: dict) -> dict:
+    checks = (
+        ("supplier", "supplier", False),
+        ("product", "product", False),
+        ("size", "size", False),
+        ("thickness_mm", "thickness_mm", True),
+        ("quantity", "quantity", True),
+        ("price", "unit_price", True),
+        ("currency", "currency", False),
+        ("price_unit", "price_unit", False),
+        ("incoterm", "incoterm", False),
+        ("payment_terms", "payment_terms", False),
+        ("valid_until", "valid_until", False),
+        ("lead_time_days", "lead_time_days", True),
+    )
+    matched, mismatches, missing = [], [], []
+    for offer_field, pi_field, numeric in checks:
+        saved_value = offer.get(offer_field)
+        if saved_value is None or str(saved_value).strip() == "":
+            continue
+        pi_value = pi.get(pi_field)
+        if pi_value is None or str(pi_value).strip() == "":
+            missing.append(pi_field)
+            continue
+        if _pi_values_equal(saved_value, pi_value, numeric=numeric):
+            matched.append(pi_field)
+        else:
+            mismatches.append({"field": pi_field, "accepted_offer": saved_value, "pi": pi_value})
+    result = "DISCREPANCIES" if mismatches else ("INCOMPLETE" if missing else "MATCH")
+    return {"result": result, "matched": matched, "mismatches": mismatches, "missing": missing}
+
+
+def _pi_review_next_action(result: str) -> str:
+    if result == "MATCH":
+        return "Review and explicitly approve the PI before any payment or production authorization"
+    if result == "DISCREPANCIES":
+        return "Resolve PI discrepancies before approval, payment, or production authorization"
+    return "Resolve missing PI details before approval, payment, or production authorization"
+
+
+async def _has_pi_review_fingerprint(user_id: str, deal_id: int, fingerprint: str) -> bool:
+    events = await get_commercial_deal_events(user_id, int(deal_id), limit=200)
+    marker = chr(34) + "fingerprint" + chr(34) + ":" + chr(34) + fingerprint + chr(34)
+    return any(
+        event.get("event_type") == "pi_review_recorded"
+        and marker in str(event.get("summary") or "")
+        for event in events
+    )
+
+
+async def _validate_pi_review_deal(user_id: str, deal_id: int):
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        return None, None, f"PI review guardrail: review not performed because deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        return None, None, f"PI review guardrail: review not performed because deal #{deal_id} is inactive/closed."
+    if str(deal.get("status") or "") != "awaiting_pi":
+        return None, None, (
+            "PI review guardrail: review blocked because the deal is not currently in "
+            f"awaiting_pi (current status={deal.get('status') or 'unknown'})."
+        )
+    if not await _has_order_execution_handoff_event(user_id, int(deal_id)):
+        return None, None, (
+            "PI review guardrail: review blocked because the explicit order / execution handoff has not been recorded."
+        )
+    if not await _has_current_offer_acceptance_event(user_id, deal):
+        return None, None, (
+            "PI review guardrail: review blocked because the deal's current saved offer does not have an explicit recorded acceptance."
+        )
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return None, None, "PI review guardrail: review blocked because the deal does not point to a saved current offer."
+    offer = await get_commercial_offer_by_id(user_id, int(offer_id))
+    if not offer:
+        return None, None, f"PI review guardrail: review blocked because current offer #{offer_id} was not found."
+    return deal, offer, None
+
+
+def _pi_review_reply(deal: dict, offer: dict, pi: dict, comparison: dict) -> str:
+    result = comparison["result"]
+    parts = [
+        "PI review guardrail: PI reviewed internally",
+        f"for deal #{deal['id']} against accepted offer #{offer['id']}.",
+        f"Result={result}.",
+    ]
+    if pi.get("pi_number"):
+        parts.append(f"PI number: {pi['pi_number']}.")
+    if comparison["mismatches"]:
+        details = "; ".join(
+            f"{item['field']} accepted={item['accepted_offer']} PI={item['pi']}"
+            for item in comparison["mismatches"]
+        )
+        parts.append("Discrepancies: " + details + ".")
+    if comparison["missing"]:
+        parts.append("Missing/unverified in the PI: " + ", ".join(comparison["missing"]) + ".")
+    if result == "MATCH":
+        parts.append("The compared saved terms match, but this is not PI approval.")
+    parts.append("Deal status remains awaiting_pi and is now waiting on you for the next decision.")
+    parts.append(
+        "No PI approval, payment, supplier message, production authorization, shipment release, or other external action was executed."
+    )
+    return " ".join(parts)
+
+
+async def _record_pi_review(user_id: str, deal: dict, offer: dict, pi: dict, *, fingerprint: str, source: str):
+    if await _has_pi_review_fingerprint(user_id, int(deal["id"]), fingerprint):
+        return (
+            "PI review guardrail: this exact PI input was already reviewed for "
+            f"deal #{deal['id']}; no duplicate PI review event was created."
+        )
+    if not pi.get("document_is_pi"):
+        return (
+            "PI review guardrail: review not recorded because the supplied content could not be reliably identified as a proforma invoice (PI)."
+        )
+    comparison = _compare_pi_to_offer(offer, pi)
+    next_action = _pi_review_next_action(comparison["result"])
+    changed = await update_commercial_deal(
+        user_id,
+        int(deal["id"]),
+        waiting_on="user",
+        next_action=next_action,
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return (
+            "PI review guardrail: the PI was extracted, but the deal tracking update failed; the PI review was not recorded."
+        )
+    event_payload = {
+        "offer_id": int(offer["id"]),
+        "fingerprint": fingerprint,
+        "result": comparison["result"],
+        "pi_number": pi.get("pi_number"),
+        "mismatches": comparison["mismatches"],
+        "missing": comparison["missing"],
+    }
+    await add_commercial_deal_event(
+        user_id,
+        int(deal["id"]),
+        "pi_review_recorded",
+        "PI review recorded; " + json.dumps(event_payload, ensure_ascii=False, separators=(",", ":")),
+        source=source,
+    )
+    if comparison["result"] == "DISCREPANCIES":
+        await add_commercial_deal_event(
+            user_id,
+            int(deal["id"]),
+            "pi_discrepancy_detected",
+            "PI discrepancies detected; " + json.dumps(
+                {"offer_id": int(offer["id"]), "fingerprint": fingerprint, "mismatches": comparison["mismatches"]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            source=source,
+        )
+    return _pi_review_reply(deal, offer, pi, comparison)
+
+
+async def _capture_pi_review_text(user_id: str, message: str):
+    if not _is_pi_review_text_request(message):
+        return None
+    deal_id = _acceptance_guard_deal_id(message)
+    if deal_id is None:
+        return (
+            "PI review guardrail: review not performed. Specify the deal ID explicitly, for example 'Review the PI for deal #5'."
+        )
+    deal, offer, error = await _validate_pi_review_deal(user_id, int(deal_id))
+    if error:
+        return error
+    if not OPENAI_API_KEY:
+        return "PI review guardrail: review not performed because the OpenAI connection is not configured."
+    fingerprint = "text:" + hashlib.sha256((message or "").encode("utf-8")).hexdigest()
+    if await _has_pi_review_fingerprint(user_id, int(deal_id), fingerprint):
+        return (
+            "PI review guardrail: this exact PI input was already reviewed for "
+            f"deal #{deal_id}; no duplicate PI review event was created."
+        )
+    from .agents import run_pi_review_text
+    extracted = await run_pi_review_text(message)
+    return await _record_pi_review(
+        user_id, deal, offer, extracted.model_dump(), fingerprint=fingerprint, source="user_text"
+    )
+
 async def _capture_user_memory(user_id: str, message: str):
     control = _extract_memory_control(message)
     if control:
@@ -3321,6 +3546,10 @@ async def _capture_user_memory(user_id: str, message: str):
     management_action = await _capture_commercial_management(user_id, message)
     if management_action:
         return management_action
+
+    pi_review_action = await _capture_pi_review_text(user_id, message)
+    if pi_review_action:
+        return pi_review_action
 
     supplier_reply_action = await _capture_supplier_reply_handoff(user_id, message)
     if supplier_reply_action:
@@ -4315,6 +4544,9 @@ def _authoritative_memory_action_reply(memory_action: str | None):
     if memory_action.startswith("Execution-stage guardrail:"):
         return memory_action.split("Execution-stage guardrail:", 1)[1].strip()
 
+    if memory_action.startswith("PI review guardrail:"):
+        return memory_action.split("PI review guardrail:", 1)[1].strip()
+
     if memory_action.startswith("Commercial memory saved:"):
         details = memory_action.split("Commercial memory saved:", 1)[1].strip()
         reply = "Commercial data saved successfully."
@@ -4404,6 +4636,53 @@ async def chat(req: ChatRequest):
         return ChatResponse(reply=reply, mode="live")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lio agent error: {exc}")
+
+
+@app.post("/pi/review", response_model=ChatResponse)
+async def review_pi_file(user_id: str, deal_id: int, file: UploadFile = File(...)):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenAI API is not configured")
+    deal, offer, error = await _validate_pi_review_deal(user_id, int(deal_id))
+    if error:
+        reply = _authoritative_memory_action_reply(error) or error
+        return ChatResponse(reply=reply, mode="live")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty PI file")
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PI file is too large; maximum size is 20 MB")
+    filename = (file.filename or "pi").strip() or "pi"
+    mime_type = (file.content_type or "").lower().strip()
+    suffix = Path(filename).suffix.lower()
+    allowed_images = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    if mime_type == "application/pdf" or suffix == ".pdf":
+        mime_type = "application/pdf"
+    elif mime_type in allowed_images or suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        if mime_type not in allowed_images:
+            mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}[suffix]
+    else:
+        raise HTTPException(status_code=415, detail="Unsupported PI file type. Use PDF, PNG, JPG/JPEG, or WEBP.")
+    fingerprint = "file:" + hashlib.sha256(data).hexdigest()
+    if await _has_pi_review_fingerprint(user_id, int(deal_id), fingerprint):
+        reply = (
+            "PI review guardrail: this exact PI file was already reviewed for "
+            f"deal #{deal_id}; no duplicate PI review event was created."
+        )
+        return ChatResponse(reply=_authoritative_memory_action_reply(reply) or reply, mode="live")
+    encoded = base64.b64encode(data).decode("ascii")
+    file_data_url = f"data:{mime_type};base64,{encoded}"
+    try:
+        from .agents import run_pi_review_file
+        extracted = await run_pi_review_file(file_data_url, filename, mime_type)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PI extraction error: {exc}")
+    reply = await _record_pi_review(
+        user_id, deal, offer, extracted.model_dump(), fingerprint=fingerprint, source="uploaded_file"
+    )
+    authoritative_reply = _authoritative_memory_action_reply(reply) or reply
+    await add_message(user_id, "user", f"PI uploaded for review; deal_id={deal_id}; filename={filename}")
+    await add_message(user_id, "assistant", authoritative_reply)
+    return ChatResponse(reply=authoritative_reply, mode="live")
 
 @app.post("/voice/transcribe")
 async def voice_transcribe(file: UploadFile = File(...)):
