@@ -342,7 +342,11 @@ def _commercial_save_intent(message: str) -> bool:
     )
 
 
-def _extract_commercial_record(message: str):
+def _extract_commercial_record(
+    message: str,
+    *,
+    supplier_override: str | None = None,
+):
     if not _commercial_save_intent(message):
         return None
 
@@ -355,6 +359,13 @@ def _extract_commercial_record(message: str):
         ],
     )
     supplier = _clean_commercial_supplier_name(supplier)
+
+    if supplier and re.match(
+        r"^(?:replied|responded|has\s+replied|has\s+responded)\b",
+        supplier,
+        flags=re.IGNORECASE,
+    ):
+        supplier = None
 
     # Preserve common legal company suffixes such as "Co., Ltd." that may contain commas.
     if supplier:
@@ -398,6 +409,9 @@ def _extract_commercial_record(message: str):
     ))
     if labelled_legal_supplier_matches:
         supplier = labelled_legal_supplier_matches[-1].group(1).strip(" \t-,:;")
+
+    if supplier_override:
+        supplier = _clean_commercial_supplier_name(supplier_override)
 
     if not supplier:
         return None
@@ -755,8 +769,22 @@ def _looks_like_supplier_offer_text(message: str) -> bool:
     return any(signal in folded for signal in signals) and any(ch.isdigit() for ch in message)
 
 
-async def _capture_commercial_memory(user_id: str, message: str):
-    record = _extract_commercial_record(message)
+async def _capture_commercial_memory(
+    user_id: str,
+    message: str,
+    *,
+    forced_supplier_id: int | None = None,
+    forced_supplier_name: str | None = None,
+    forced_product_id: int | None = None,
+):
+    record = _extract_commercial_record(
+        message,
+        supplier_override=(
+            forced_supplier_name
+            if forced_supplier_id is not None
+            else None
+        ),
+    )
 
     # Review-then-save workflow:
     # If the user says "save this offer" after first pasting/analyzing it,
@@ -771,7 +799,14 @@ async def _capture_commercial_memory(user_id: str, message: str):
             if not prior or not _looks_like_supplier_offer_text(prior):
                 continue
             candidate = prior + "\n" + message
-            candidate_record = _extract_commercial_record(candidate)
+            candidate_record = _extract_commercial_record(
+                candidate,
+                supplier_override=(
+                    forced_supplier_name
+                    if forced_supplier_id is not None
+                    else None
+                ),
+            )
             if candidate_record:
                 record = candidate_record
                 break
@@ -779,19 +814,31 @@ async def _capture_commercial_memory(user_id: str, message: str):
     if not record:
         return None
 
-    supplier_id = await upsert_commercial_supplier(
-        user_id,
-        record["supplier"],
-        country=record["country"],
-        city=record["city"],
-        website=record["website"],
-    )
+    if forced_supplier_id is not None:
+        supplier_id = int(forced_supplier_id)
+        supplier_display_name = (
+            forced_supplier_name
+            or record.get("supplier")
+            or f"Supplier #{supplier_id}"
+        )
+    else:
+        supplier_id = await upsert_commercial_supplier(
+            user_id,
+            record["supplier"],
+            country=record["country"],
+            city=record["city"],
+            website=record["website"],
+        )
+        supplier_display_name = record["supplier"]
 
     for language in record.get("languages", []):
         await add_commercial_supplier_language(user_id, supplier_id, language)
 
-    product_id = None
-    if record["product"] or record["size"] or record["thickness_mm"] is not None:
+    product_id = int(forced_product_id) if forced_product_id is not None else None
+    if (
+        forced_product_id is None
+        and (record["product"] or record["size"] or record["thickness_mm"] is not None)
+    ):
         product_name = record["product"] or "Commercial product"
         existing_product = await find_exact_commercial_product(
             user_id,
@@ -871,7 +918,7 @@ async def _capture_commercial_memory(user_id: str, message: str):
                 source="user_message",
             )
 
-    saved_parts = [f"supplier={record['supplier']}"]
+    saved_parts = [f"supplier={supplier_display_name}"]
     if product_id is not None:
         saved_parts.append(f"product={record['product'] or 'Commercial product'}")
     if offer_id is not None:
@@ -2390,7 +2437,17 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
             )
 
         else:
-            commercial_save_status = await _capture_commercial_memory(user_id, message)
+            commercial_save_status = await _capture_commercial_memory(
+                user_id,
+                message,
+                forced_supplier_id=int(deal["supplier_id"]),
+                forced_supplier_name=deal.get("supplier"),
+                forced_product_id=(
+                    int(deal["product_id"])
+                    if deal.get("product_id") is not None
+                    else None
+                ),
+            )
             if not commercial_save_status:
                 commercial_save_status = (
                     "Commercial save was explicitly requested but no complete commercial "
