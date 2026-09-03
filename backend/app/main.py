@@ -2608,6 +2608,174 @@ async def _persistent_context(user_id: str) -> str:
     )
 
 
+
+
+def _offer_decision_action_handoff(guidance: dict | None) -> dict | None:
+    # Map advisory offer guidance to a safe, non-executing next action.
+    if not guidance:
+        return None
+
+    decision = str(guidance.get("decision") or "").strip().upper()
+    missing = [str(x) for x in (guidance.get("missing_new") or []) if str(x).strip()]
+
+    if decision == "REQUEST_CLARIFICATION":
+        action = "PREPARE_CLARIFICATION"
+        instruction = (
+            "Prepare a concise supplier clarification reply. Ask only for missing or unclear "
+            "commercial facts supported by the saved guidance. Do not invent target prices, "
+            "deadlines, commitments, concessions, or specifications."
+        )
+        if missing:
+            instruction += " Missing saved fields to clarify: " + ", ".join(missing) + "."
+    elif decision == "NEGOTIATE":
+        action = "PREPARE_NEGOTIATION"
+        instruction = (
+            "Prepare an evidence-based negotiation reply using only saved commercial facts. "
+            "If the user has not supplied a target price, ask for the supplier's best/improved "
+            "price or justification rather than inventing a numeric target. Do not send anything."
+        )
+    elif decision == "FOLLOW_UP":
+        action = "PREPARE_FOLLOW_UP"
+        instruction = (
+            "Prepare a concise supplier follow-up using the existing follow-up drafting rules. "
+            "Do not invent a deadline or claim that any message was sent."
+        )
+    elif decision == "ACCEPT":
+        action = "PREPARE_ACCEPTANCE_REVIEW"
+        instruction = (
+            "Prepare an acceptance-review step and, if useful, a draft acceptance message for "
+            "the user's review only. Explicit user approval is still required before any acceptance, "
+            "sending, deal-status change, or other external action."
+        )
+    else:
+        return None
+
+    return {
+        "decision": decision,
+        "action": action,
+        "instruction": instruction,
+        "new_offer_id": guidance.get("new_offer_id"),
+        "previous_offer_id": guidance.get("previous_offer_id"),
+        "missing_new": missing,
+        "reason": guidance.get("reason"),
+        "price_change": guidance.get("price_change"),
+        "price_change_pct": guidance.get("price_change_pct"),
+    }
+
+
+def _is_offer_decision_action_request(message: str) -> bool:
+    folded = (message or "").casefold()
+
+    action_signals = (
+        "prepare the next step", "prepare next step", "next action", "what should i send",
+        "what should we send", "draft reply", "draft a reply", "write a reply",
+        "prepare a reply", "prepare reply", "draft message", "prepare message",
+        "reply to the supplier", "respond to the supplier", "what do i send",
+        "nächster schritt", "naechster schritt", "antwort formulieren",
+        "antwort vorbereiten", "nachricht vorbereiten", "lieferant antworten",
+        "الخطوة التالية", "ما الخطوة التالية", "جهز الرد", "جهّز الرد", "حضر الرد",
+        "حضّر الرد", "اكتب الرد", "صياغة الرد", "جهز رسالة", "جهّز رسالة",
+        "اكتب رسالة", "ماذا نرسل", "ماذا أرسل", "ماذا ارسل", "الرد على المورد",
+    )
+    commercial_signals = (
+        "offer", "supplier", "deal", "quotation", "price",
+        "angebot", "lieferant", "preis",
+        "عرض", "مورد", "صفقة", "سعر",
+    )
+
+    return any(x in folded for x in action_signals) and any(
+        x in folded for x in commercial_signals
+    )
+
+
+async def _commercial_offer_decision_action_handoff_context(user_id: str, message: str) -> str:
+    # Build read-only action-preparation context from the latest saved offer guidance.
+    if not _is_offer_decision_action_request(message):
+        return ""
+
+    deal_id_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        _deal_followup_ascii_digits(message or ""),
+        flags=re.IGNORECASE,
+    )
+
+    supplier_id = None
+    deal_id = None
+    if deal_id_match:
+        deal_id = int(deal_id_match.group(1))
+        deal = await get_commercial_deal_by_id(user_id, deal_id)
+        if deal:
+            supplier_id = deal.get("supplier_id")
+
+    if supplier_id is None:
+        deals = await get_commercial_deals(user_id, active_only=True, limit=20)
+        if len(deals) == 1:
+            deal_id = deals[0].get("id")
+            supplier_id = deals[0].get("supplier_id")
+
+    if supplier_id is None:
+        return (
+            "SMART DECISION ACTION HANDOFF.\n"
+            "No unique active supplier/deal could be resolved. Ask the user to specify the deal ID or supplier.\n"
+            "Do not send, accept, reject, save, or change any deal automatically."
+        )
+
+    guidance = await _commercial_offer_decision_guidance(
+        user_id,
+        supplier_id=int(supplier_id),
+    )
+    handoff = _offer_decision_action_handoff(guidance)
+    if not handoff:
+        return (
+            "SMART DECISION ACTION HANDOFF.\n"
+            "No actionable saved offer guidance is available yet.\n"
+            "Do not invent commercial facts or execute any external action."
+        )
+
+    lines = [
+        "SMART DECISION ACTION HANDOFF.",
+        "This is preparation only. Do not send, accept, reject, save, close, or change a deal automatically.",
+        "Use only saved commercial facts and explicit user instructions.",
+        f"Deal ID: {deal_id}" if deal_id is not None else "Deal ID: unresolved",
+        f"Advisory decision: {handoff['decision']}",
+        f"Safe handoff action: {handoff['action']}",
+        f"Instruction: {handoff['instruction']}",
+    ]
+
+    if handoff.get("new_offer_id") is not None:
+        lines.append(f"New offer ID: {handoff['new_offer_id']}")
+    if handoff.get("previous_offer_id") is not None:
+        lines.append(f"Previous offer ID: {handoff['previous_offer_id']}")
+    if handoff.get("price_change") is not None:
+        lines.append(f"Saved price change: {handoff['price_change']:.6g}")
+    if handoff.get("price_change_pct") is not None:
+        lines.append(f"Saved price change percent: {handoff['price_change_pct']:.4g}%")
+    if handoff.get("missing_new"):
+        lines.append("Missing saved fields: " + ", ".join(handoff["missing_new"]))
+    if handoff.get("reason"):
+        lines.append("Decision reason: " + str(handoff["reason"]))
+
+    if handoff["action"] == "PREPARE_CLARIFICATION":
+        lines.append(
+            "Output preference: briefly explain what is missing, then provide a send-ready supplier clarification draft."
+        )
+    elif handoff["action"] == "PREPARE_NEGOTIATION":
+        lines.append(
+            "Output preference: briefly state the evidence-based negotiation angle, then provide a send-ready negotiation draft."
+        )
+    elif handoff["action"] == "PREPARE_FOLLOW_UP":
+        lines.append(
+            "Output preference: provide a concise send-ready follow-up draft and clearly state that it has not been sent."
+        )
+    elif handoff["action"] == "PREPARE_ACCEPTANCE_REVIEW":
+        lines.append(
+            "Output preference: summarize why acceptance is being considered and provide a review-only draft. "
+            "State clearly that explicit user approval is still required and nothing has been accepted or sent."
+        )
+
+    return "\n".join(lines)
+
+
 def _authoritative_memory_action_reply(memory_action: str | None):
     if not memory_action:
         return None
@@ -2670,6 +2838,24 @@ def _authoritative_memory_action_reply(memory_action: str | None):
             if values.get("reason"):
                 parts.append(values["reason"])
 
+            decision = str(values.get("decision") or "").upper()
+            if decision == "REQUEST_CLARIFICATION":
+                parts.append(
+                    "Next step: prepare a clarification reply for the missing or unclear commercial terms before any acceptance."
+                )
+            elif decision == "NEGOTIATE":
+                parts.append(
+                    "Next step: prepare an evidence-based negotiation reply; no target price is assumed unless you supplied one."
+                )
+            elif decision == "FOLLOW_UP":
+                parts.append(
+                    "Next step: prepare a supplier follow-up. Nothing has been sent automatically."
+                )
+            elif decision == "ACCEPT":
+                parts.append(
+                    "Next step: review and explicitly approve an acceptance reply. Nothing has been accepted or sent automatically."
+                )
+
         return " ".join(parts)
 
     if memory_action.startswith("Commercial memory saved:"):
@@ -2721,6 +2907,9 @@ async def chat(req: ChatRequest):
     decision_guidance_context = await _commercial_offer_decision_guidance_context(
         req.user_id, req.message
     )
+    decision_action_handoff_context = await _commercial_offer_decision_action_handoff_context(
+        req.user_id, req.message
+    )
     memory_action_context = (
         f"Internal memory status for this turn: {memory_action}"
         if memory_action
@@ -2732,6 +2921,7 @@ async def chat(req: ChatRequest):
             persistent_context,
             comparison_context,
             decision_guidance_context,
+            decision_action_handoff_context,
             memory_action_context,
             recent_context,
         ]
