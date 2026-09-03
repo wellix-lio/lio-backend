@@ -3240,6 +3240,110 @@ async def _execution_stage_transition_allowed(user_id: str, deal: dict, target_s
 
     return True, None
 
+
+def _extract_deal_status_by_id_command(message: str):
+    raw = _deal_followup_ascii_digits(message or "")
+    folded = raw.casefold()
+
+    deal_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not deal_match:
+        return None
+
+    explicit_change_signals = (
+        "set deal", "change deal", "update deal", "status to", "status=",
+        "غيّر حالة", "غير حالة", "تغيير حالة", "حدّث حالة", "حدث حالة",
+        "حالة الصفقة", "status ändern", "status aendern", "status setzen",
+    )
+    if not any(signal in folded for signal in explicit_change_signals):
+        return None
+
+    status_aliases = (
+        ("awaiting_pi", ("awaiting_pi", "awaiting pi")),
+        ("production", ("production", "الإنتاج", "الانتاج", "produktion")),
+        ("inspection", ("inspection", "الفحص", "التفتيش", "inspektion")),
+        ("ready_to_ship", ("ready_to_ship", "ready to ship", "جاهز للشحن", "جاهزة للشحن", "versandbereit")),
+        ("completed", ("completed", "complete", "مكتملة", "مكتمل", "abgeschlossen")),
+        ("cancelled", ("cancelled", "canceled", "ملغاة", "ملغى", "storniert")),
+    )
+
+    target_status = None
+    for canonical, aliases in status_aliases:
+        if any(alias.casefold() in folded for alias in aliases):
+            target_status = canonical
+            break
+
+    if target_status is None:
+        return None
+
+    return {"deal_id": int(deal_match.group(1)), "status": target_status}
+
+
+async def _capture_deal_tracking_by_id(user_id: str, message: str):
+    command = _extract_deal_status_by_id_command(message)
+    if not command:
+        return None
+
+    deal_id = int(command["deal_id"])
+    status = command["status"]
+
+    deal = await get_commercial_deal_by_id(user_id, deal_id)
+    if not deal:
+        return f"Deal tracking not applied: deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        return f"Deal tracking not applied: deal #{deal_id} is inactive/closed."
+
+    if status == "completed":
+        return (
+            "Deal closing guardrail: completion not applied through status tracking. "
+            "Use the explicit deal-closing command after the current offer has an "
+            "explicit recorded acceptance."
+        )
+
+    if status == "cancelled":
+        return (
+            "Deal tracking not applied: cancellation requires a separate explicit "
+            "cancellation workflow; no status change was made."
+        )
+
+    execution_allowed, execution_error = await _execution_stage_transition_allowed(
+        user_id, deal, status
+    )
+    if not execution_allowed:
+        return execution_error
+
+    waiting_next = {
+        "production": ("supplier", "Monitor production progress and the agreed lead time"),
+        "inspection": ("inspection", "Complete inspection and record the result"),
+        "ready_to_ship": ("supplier", "Confirm shipping documents and shipment release"),
+    }
+    waiting_on, next_action = waiting_next.get(
+        status, (deal.get("waiting_on"), deal.get("next_action"))
+    )
+
+    changed = await update_commercial_deal(
+        user_id,
+        deal_id,
+        status=status,
+        waiting_on=waiting_on,
+        next_action=next_action,
+    )
+    if not changed:
+        return (
+            f"Deal tracking not applied: deal #{deal_id} could not be updated. "
+            "No external action was executed."
+        )
+
+    return (
+        f"Deal tracking updated: deal_id={deal_id}; status={status}; "
+        f"waiting_on={waiting_on}; next_action={next_action}. "
+        "No payment, supplier message, production command, shipment release, "
+        "or other external action was executed."
+    )
+
 async def _capture_deal_tracking(user_id: str, message: str):
     command = _extract_deal_tracking_status(message)
     if not command:
@@ -3802,6 +3906,10 @@ async def _capture_user_memory(user_id: str, message: str):
     )
     if order_execution_action:
         return order_execution_action
+
+    deal_by_id_action = await _capture_deal_tracking_by_id(user_id, message)
+    if deal_by_id_action:
+        return deal_by_id_action
 
     deal_action = await _capture_deal_tracking(user_id, message)
     if deal_action:
