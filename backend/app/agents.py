@@ -108,6 +108,17 @@ PI review and verification guardrails:
 - PI extraction is factual only. Do not decide whether payment should be made and do not interpret a matching PI as user approval.
 """
 
+PI_APPROVAL_PAYMENT_RULES = """
+PI approval and payment guardrails:
+- PI review and PI approval are separate steps. A MATCH review does not itself approve the PI.
+- Record PI approval only after an explicit user instruction that identifies the deal. Bind approval to the latest recorded PI review fingerprint and the deal's current accepted offer.
+- Approve only when the latest PI review result is MATCH with no recorded mismatches and no missing/unverified compared fields. Never approve an older PI after a newer PI review exists.
+- A PI approval record is internal authorization evidence only. It does not make a payment, send a supplier message, authorize production externally, release a shipment, or change an external system.
+- Never execute, claim to execute, or simulate a supplier payment, deposit, bank transfer, wire, card payment, or other transfer of funds from conversational instructions alone.
+- If the user asks Lio to make/send/transfer a payment, keep the request blocked unless a separately verified payment execution integration and workflow exists. PI approval alone is never payment authorization/execution.
+- Moving from awaiting_pi to production requires an explicit approval event for the latest MATCH PI tied to the current accepted offer.
+"""
+
 class PIReviewExtraction(BaseModel):
     document_is_pi: bool
     pi_number: str | None
@@ -192,7 +203,7 @@ async def run_pi_review_text(text: str) -> PIReviewExtraction:
 business_agent = Agent(
     name="Lio Business",
     model=OPENAI_DEFAULT_MODEL,
-    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + SUPPLIER_FOLLOWUP_DRAFTING_RULES + PI_REVIEW_RULES + """
+    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + SUPPLIER_FOLLOWUP_DRAFTING_RULES + PI_REVIEW_RULES + PI_APPROVAL_PAYMENT_RULES + PI_APPROVAL_PAYMENT_RULES + """
 You specialize in commercial tasks: suppliers, offers, procurement, pricing,
 logistics, negotiation preparation, market comparison, and business analysis.
 

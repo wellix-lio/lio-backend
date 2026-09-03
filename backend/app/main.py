@@ -3224,6 +3224,14 @@ async def _execution_stage_transition_allowed(user_id: str, deal: dict, target_s
             "Record the intermediate execution stage first."
         )
 
+    if target_status == "production" and current_status == "awaiting_pi":
+        if not await _has_current_pi_approval_event(user_id, deal):
+            return False, (
+                "Execution-stage guardrail: production transition blocked because the "
+                "latest MATCH PI for the current accepted offer does not have an explicit "
+                "recorded PI approval."
+            )
+
     if target_rank < current_rank:
         return False, (
             "Execution-stage guardrail: backward execution-stage change blocked. "
@@ -3534,6 +3542,220 @@ async def _capture_pi_review_text(user_id: str, message: str):
         user_id, deal, offer, extracted.model_dump(), fingerprint=fingerprint, source="user_text"
     )
 
+
+
+def _is_explicit_pi_approval_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "approve pi", "approve the pi", "approve proforma", "approve the proforma",
+        "approve proforma invoice", "approve the proforma invoice", "confirm pi approval",
+        "اعتمد pi", "اعتمد الـ pi", "اعتمد ال pi", "اعتمد الفاتورة المبدئية",
+        "اعتمد الفاتورة الأولية", "وافق على pi", "وافق على الـ pi",
+        "وافق على الفاتورة المبدئية", "وافق على الفاتورة الأولية",
+        "pi freigeben", "pi genehmigen", "proforma-rechnung freigeben",
+        "proforma-rechnung genehmigen", "proforma rechnung freigeben",
+        "proforma rechnung genehmigen",
+    )
+    return any(signal in folded for signal in signals)
+
+
+def _is_payment_execution_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    signals = (
+        "pay supplier", "pay the supplier", "make payment", "make the payment",
+        "send payment", "send the payment", "pay deposit", "pay the deposit",
+        "send deposit", "send the deposit", "transfer payment", "transfer the payment",
+        "wire payment", "wire the payment", "wire the deposit",
+        "تحويل الدفعة", "حول الدفعة", "حوّل الدفعة", "ادفع للمورد", "ادفع المورد",
+        "ادفع العربون", "حول العربون", "حوّل العربون", "ارسل الدفعة", "أرسل الدفعة",
+        "zahlung senden", "zahlung überweisen", "zahlung ueberweisen",
+        "anzahlung senden", "anzahlung überweisen", "anzahlung ueberweisen",
+        "lieferanten bezahlen",
+    )
+    return any(signal in folded for signal in signals)
+
+
+def _parse_pi_review_event_summary(summary: str | None):
+    prefix = "PI review recorded; "
+    text = str(summary or "")
+    if not text.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(text[len(prefix):])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _latest_pi_review_record(user_id: str, deal_id: int):
+    events = await get_commercial_deal_events(user_id, int(deal_id), limit=200)
+    for event in reversed(events):
+        if event.get("event_type") != "pi_review_recorded":
+            continue
+        payload = _parse_pi_review_event_summary(event.get("summary"))
+        if payload:
+            return event, payload
+    return None, None
+
+
+async def _has_pi_approval_for_fingerprint(user_id: str, deal_id: int, offer_id: int, fingerprint: str) -> bool:
+    events = await get_commercial_deal_events(user_id, int(deal_id), limit=200)
+    offer_marker = f"offer_id={int(offer_id)}"
+    fingerprint_marker = f"fingerprint={fingerprint}"
+    return any(
+        event.get("event_type") == "pi_approval_approved"
+        and offer_marker in str(event.get("summary") or "")
+        and fingerprint_marker in str(event.get("summary") or "")
+        for event in events
+    )
+
+
+async def _has_current_pi_approval_event(user_id: str, deal: dict) -> bool:
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return False
+    _, payload = await _latest_pi_review_record(user_id, int(deal["id"]))
+    if not payload:
+        return False
+    try:
+        reviewed_offer_id = int(payload.get("offer_id"))
+    except (TypeError, ValueError):
+        return False
+    fingerprint = str(payload.get("fingerprint") or "").strip()
+    if reviewed_offer_id != int(offer_id) or not fingerprint:
+        return False
+    if str(payload.get("result") or "").upper() != "MATCH":
+        return False
+    if payload.get("mismatches") or payload.get("missing"):
+        return False
+    return await _has_pi_approval_for_fingerprint(
+        user_id, int(deal["id"]), int(offer_id), fingerprint
+    )
+
+
+async def _capture_pi_approval_payment_guardrails(user_id: str, message: str):
+    approve_pi = _is_explicit_pi_approval_request(message)
+    payment_request = _is_payment_execution_request(message)
+    if not approve_pi and not payment_request:
+        return None
+
+    deal_id = _acceptance_guard_deal_id(message)
+    if deal_id is None:
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action not applied. Specify the deal ID explicitly."
+
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action not applied because deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action not applied because deal #{deal_id} is inactive/closed."
+
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action blocked because the deal does not point to a current saved offer."
+
+    if not await _has_current_offer_acceptance_event(user_id, deal):
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action blocked because current offer #{offer_id} does not have an explicit recorded acceptance."
+
+    if not await _has_order_execution_handoff_event(user_id, int(deal_id)):
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action blocked because the order / execution handoff has not been started."
+
+    _, payload = await _latest_pi_review_record(user_id, int(deal_id))
+    if not payload:
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action blocked because no recorded PI review exists for deal #{deal_id}."
+
+    try:
+        reviewed_offer_id = int(payload.get("offer_id"))
+    except (TypeError, ValueError):
+        reviewed_offer_id = None
+    fingerprint = str(payload.get("fingerprint") or "").strip()
+    result = str(payload.get("result") or "").upper()
+    mismatches = payload.get("mismatches") or []
+    missing = payload.get("missing") or []
+    pi_number = payload.get("pi_number")
+
+    if reviewed_offer_id != int(offer_id):
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        return f"{prefix} action blocked because the latest PI review is tied to offer #{reviewed_offer_id}, while the deal's current offer is #{offer_id}."
+
+    if result != "MATCH" or mismatches or missing or not fingerprint:
+        prefix = "PI approval guardrail:" if approve_pi else "Payment guardrail:"
+        details = []
+        if result:
+            details.append(f"latest_result={result}")
+        if mismatches:
+            details.append("discrepancies_present")
+        if missing:
+            details.append("missing_fields_present")
+        suffix = f" ({', '.join(details)})" if details else ""
+        return f"{prefix} action blocked because the latest PI is not an approval-safe MATCH{suffix}. Resolve and re-review the PI first."
+
+    already_approved = await _has_pi_approval_for_fingerprint(
+        user_id, int(deal_id), int(offer_id), fingerprint
+    )
+
+    if payment_request:
+        if not already_approved:
+            return "Payment guardrail: payment blocked because the latest MATCH PI has not been explicitly approved yet."
+        return (
+            "Payment guardrail: the latest MATCH PI is explicitly approved internally, "
+            "but no payment was executed. Lio does not execute supplier payments in this "
+            "stage; a separate verified payment workflow is required."
+        )
+
+    if str(deal.get("status") or "") != "awaiting_pi":
+        return (
+            "PI approval guardrail: approval blocked because the deal is not currently "
+            f"in awaiting_pi (current status={deal.get('status') or 'unknown'})."
+        )
+
+    if already_approved:
+        return f"PI approval guardrail: the latest reviewed PI is already explicitly approved internally for deal #{deal_id}; no duplicate approval event was created."
+
+    summary_parts = [
+        "Explicit user PI approval recorded",
+        f"offer_id={int(offer_id)}",
+        f"fingerprint={fingerprint}",
+        "result=MATCH",
+    ]
+    if pi_number:
+        summary_parts.append(f"pi_number={pi_number}")
+
+    changed = await update_commercial_deal(
+        user_id,
+        int(deal_id),
+        waiting_on="user",
+        next_action="Proceed to payment verification / production authorization workflow",
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return (
+            "PI approval guardrail: approval not recorded because the deal tracking "
+            "update failed. No payment or production authorization was executed."
+        )
+
+    await add_commercial_deal_event(
+        user_id,
+        int(deal_id),
+        "pi_approval_approved",
+        "; ".join(summary_parts),
+        source="user",
+    )
+
+    return (
+        "PI approval guardrail: explicit PI approval recorded internally; "
+        f"deal_id={deal_id}; offer_id={offer_id}"
+        + (f"; pi_number={pi_number}" if pi_number else "")
+        + ". Deal status remains awaiting_pi. No payment, supplier message, production "
+          "authorization, shipment release, or other external action was executed."
+    )
+
 async def _capture_user_memory(user_id: str, message: str):
     control = _extract_memory_control(message)
     if control:
@@ -3550,6 +3772,12 @@ async def _capture_user_memory(user_id: str, message: str):
     pi_review_action = await _capture_pi_review_text(user_id, message)
     if pi_review_action:
         return pi_review_action
+
+    pi_approval_payment_action = await _capture_pi_approval_payment_guardrails(
+        user_id, message
+    )
+    if pi_approval_payment_action:
+        return pi_approval_payment_action
 
     supplier_reply_action = await _capture_supplier_reply_handoff(user_id, message)
     if supplier_reply_action:
@@ -4546,6 +4774,12 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("PI review guardrail:"):
         return memory_action.split("PI review guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("PI approval guardrail:"):
+        return memory_action.split("PI approval guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Payment guardrail:"):
+        return memory_action.split("Payment guardrail:", 1)[1].strip()
 
     if memory_action.startswith("Commercial memory saved:"):
         details = memory_action.split("Commercial memory saved:", 1)[1].strip()
