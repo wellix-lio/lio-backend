@@ -2829,6 +2829,233 @@ async def _capture_deal_followup_due(user_id: str, message: str):
     )
 
 
+
+
+def _acceptance_guard_deal_id(message: str):
+    m = re.search(
+        r"(?:deal|الصفقة|صفقة)\s*(?:id|رقم|#)?\s*[:#]?\s*(\d+)",
+        _deal_followup_ascii_digits(message or ""),
+        flags=re.IGNORECASE,
+    )
+    return int(m.group(1)) if m else None
+
+
+def _acceptance_guard_offer_id(message: str):
+    m = re.search(
+        r"(?:offer|العرض|عرض)\s*(?:id|رقم|#)?\s*[:#]?\s*(\d+)",
+        _deal_followup_ascii_digits(message or ""),
+        flags=re.IGNORECASE,
+    )
+    return int(m.group(1)) if m else None
+
+
+def _is_explicit_offer_acceptance_request(message: str) -> bool:
+    folded = (message or "").casefold()
+
+    strong = (
+        "accept the offer", "accept offer", "approve the offer", "approve offer",
+        "i accept the offer", "we accept the offer", "record my acceptance",
+        "اقبل العرض", "أقبل العرض", "وافق على العرض", "أوافق على العرض",
+        "اعتمد العرض", "أعتمد العرض", "سجل قبولي", "سجّل قبولي",
+        "angebot annehmen", "ich nehme das angebot an", "angebot akzeptieren",
+        "annahme bestätigen", "annahme bestaetigen",
+    )
+    return any(x in folded for x in strong)
+
+
+def _is_explicit_deal_close_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    strong = (
+        "close deal", "close the deal", "mark deal", "mark the deal",
+        "complete deal", "complete the deal", "mark as completed",
+        "close as completed", "record the deal as completed",
+        "اغلق الصفقة", "أغلق الصفقة", "اقفل الصفقة", "أقفل الصفقة",
+        "انه الصفقة", "أنهِ الصفقة", "انهي الصفقة", "أنهي الصفقة",
+        "سجل الصفقة مكتملة", "سجّل الصفقة مكتملة", "اعتبر الصفقة مكتملة",
+        "deal abschließen", "deal abschliessen", "deal als abgeschlossen markieren",
+    )
+    return any(x in folded for x in strong)
+
+
+async def _resolve_acceptance_guard_deal(
+    user_id: str,
+    message: str,
+    *,
+    require_explicit_id: bool = False,
+):
+    deal_id = _acceptance_guard_deal_id(message)
+
+    if deal_id is not None:
+        deal = await get_commercial_deal_by_id(user_id, deal_id)
+        if not deal:
+            return None, f"Commercial approval not applied: deal #{deal_id} was not found."
+        return deal, None
+
+    if require_explicit_id:
+        return None, (
+            "Deal closure not applied: specify the deal ID explicitly, for example "
+            "'Close deal #4 as completed'."
+        )
+
+    deals = await get_commercial_deals(user_id, active_only=True, limit=20)
+    if not deals:
+        return None, "Commercial approval not applied: there is no active deal."
+    if len(deals) > 1:
+        return None, (
+            "Commercial approval not applied: multiple active deals exist; specify the deal ID."
+        )
+    return deals[0], None
+
+
+async def _has_current_offer_acceptance_event(user_id: str, deal: dict) -> bool:
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return False
+
+    marker = f"offer_id={int(offer_id)}"
+    events = await get_commercial_deal_events(
+        user_id,
+        int(deal["id"]),
+        limit=200,
+    )
+    return any(
+        event.get("event_type") == "offer_acceptance_approved"
+        and marker in str(event.get("summary") or "")
+        for event in events
+    )
+
+
+async def _capture_acceptance_and_closing_guardrails(user_id: str, message: str):
+    explicit_accept = _is_explicit_offer_acceptance_request(message)
+    explicit_close = _is_explicit_deal_close_request(message)
+
+    if not explicit_accept and not explicit_close:
+        return None
+
+    if explicit_close:
+        deal, error = await _resolve_acceptance_guard_deal(
+            user_id,
+            message,
+            require_explicit_id=True,
+        )
+        if error:
+            return "Deal closing guardrail: " + error
+
+        if not deal.get("is_active"):
+            return (
+                "Deal closing guardrail: deal #%s is already inactive/closed."
+                % deal["id"]
+            )
+
+        if not await _has_current_offer_acceptance_event(user_id, deal):
+            return (
+                "Deal closing guardrail: closure blocked. The current saved offer "
+                f"ID {deal.get('offer_id')} does not have an explicit recorded acceptance. "
+                "Accept the current offer explicitly first; the deal remains open."
+            )
+
+        changed = await update_commercial_deal(
+            user_id,
+            int(deal["id"]),
+            status="completed",
+            waiting_on="none",
+            next_action="No further action",
+            clear_next_action_due=bool(deal.get("next_action_due")),
+        )
+        if not changed:
+            return "Deal closing guardrail: deal closure failed; no status change was recorded."
+
+        await add_commercial_deal_event(
+            user_id,
+            int(deal["id"]),
+            "deal_closed_explicitly",
+            (
+                f"Explicit deal closure approved by user; "
+                f"offer_id={deal.get('offer_id')}; status=completed"
+            ),
+            source="user",
+        )
+        return (
+            "Deal closing guardrail: deal closed explicitly; "
+            f"deal_id={deal['id']}; offer_id={deal.get('offer_id')}; status=completed. "
+            "This was an internal deal-status change only; no supplier message was sent."
+        )
+
+    deal, error = await _resolve_acceptance_guard_deal(
+        user_id,
+        message,
+        require_explicit_id=False,
+    )
+    if error:
+        return "Offer acceptance guardrail: " + error
+
+    if not deal.get("is_active"):
+        return (
+            "Offer acceptance guardrail: acceptance not recorded because deal "
+            f"#{deal['id']} is inactive/closed."
+        )
+
+    latest_offer_id = deal.get("offer_id")
+    if latest_offer_id is None:
+        return (
+            "Offer acceptance guardrail: acceptance not recorded because the deal "
+            "does not point to a saved current offer."
+        )
+
+    requested_offer_id = _acceptance_guard_offer_id(message)
+    if requested_offer_id is not None and int(requested_offer_id) != int(latest_offer_id):
+        return (
+            "Offer acceptance guardrail: acceptance blocked because the requested "
+            f"offer ID {requested_offer_id} is not the deal's current saved offer "
+            f"ID {latest_offer_id}."
+        )
+
+    guidance = await _commercial_offer_decision_guidance(
+        user_id,
+        supplier_id=int(deal["supplier_id"]),
+        newest_offer_id=int(latest_offer_id),
+    )
+    if not guidance or guidance.get("decision") != "ACCEPT":
+        decision = (guidance or {}).get("decision") or "UNAVAILABLE"
+        return (
+            "Offer acceptance guardrail: acceptance blocked. The current saved offer "
+            f"is not in ACCEPT guidance state (current guidance={decision}). "
+            "Review the missing/comparability issues first."
+        )
+
+    if await _has_current_offer_acceptance_event(user_id, deal):
+        return (
+            "Offer acceptance guardrail: the current offer is already explicitly "
+            f"accepted internally; deal_id={deal['id']}; offer_id={latest_offer_id}. "
+            "The deal is still not closed."
+        )
+
+    await add_commercial_deal_event(
+        user_id,
+        int(deal["id"]),
+        "offer_acceptance_approved",
+        (
+            f"Explicit user acceptance recorded; offer_id={int(latest_offer_id)}; "
+            f"decision=ACCEPT; previous_offer_id={guidance.get('previous_offer_id')}"
+        ),
+        source="user",
+    )
+
+    await update_commercial_deal(
+        user_id,
+        int(deal["id"]),
+        waiting_on="user",
+        next_action="Proceed to order / execution handoff",
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+
+    return (
+        "Offer acceptance guardrail: explicit acceptance recorded internally; "
+        f"deal_id={deal['id']}; offer_id={latest_offer_id}. "
+        "The deal remains open and is not marked completed. "
+        "No supplier message was sent. Next step: order / execution handoff."
+    )
+
 async def _capture_deal_tracking(user_id: str, message: str):
     command = _extract_deal_tracking_status(message)
     if not command:
@@ -2847,6 +3074,14 @@ async def _capture_deal_tracking(user_id: str, message: str):
         limit=10,
     )
     status = command["status"]
+
+    if status == "completed":
+        return (
+            "Deal closing guardrail: legacy completion wording was not applied. "
+            "To close a deal, use an explicit command with the deal ID after the "
+            "current offer has an explicit recorded acceptance, for example "
+            "'Close deal #4 as completed'."
+        )
 
     if active_deals:
         deal = active_deals[0]
@@ -2917,6 +3152,12 @@ async def _capture_user_memory(user_id: str, message: str):
     followup_due_action = await _capture_deal_followup_due(user_id, message)
     if followup_due_action:
         return followup_due_action
+
+    acceptance_closing_action = await _capture_acceptance_and_closing_guardrails(
+        user_id, message
+    )
+    if acceptance_closing_action:
+        return acceptance_closing_action
 
     deal_action = await _capture_deal_tracking(user_id, message)
     if deal_action:
@@ -3874,6 +4115,12 @@ def _authoritative_memory_action_reply(memory_action: str | None):
                 )
 
         return " ".join(parts)
+
+    if memory_action.startswith("Offer acceptance guardrail:"):
+        return memory_action.split("Offer acceptance guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Deal closing guardrail:"):
+        return memory_action.split("Deal closing guardrail:", 1)[1].strip()
 
     if memory_action.startswith("Commercial memory saved:"):
         details = memory_action.split("Commercial memory saved:", 1)[1].strip()
