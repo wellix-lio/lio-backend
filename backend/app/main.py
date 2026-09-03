@@ -2466,6 +2466,25 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
         if (
             commercial_save_status
             and commercial_save_status.startswith("Commercial memory saved:")
+        ):
+            saved_offer_match = re.search(
+                r"offer_id=(\d+)",
+                commercial_save_status,
+            )
+            if saved_offer_match:
+                saved_offer_id = int(saved_offer_match.group(1))
+                if deal.get("offer_id") != saved_offer_id:
+                    pointer_updated = await update_commercial_deal(
+                        user_id,
+                        int(deal["id"]),
+                        offer_id=saved_offer_id,
+                    )
+                    if pointer_updated:
+                        deal["offer_id"] = saved_offer_id
+
+        if (
+            commercial_save_status
+            and commercial_save_status.startswith("Commercial memory saved:")
             and clarification_result is None
         ):
             negotiation_offer_match = re.search(
