@@ -1576,6 +1576,7 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
     )
 
     commercial_save_status = None
+    decision_guidance_status = None
     if request["explicit_commercial_save"]:
         commercial_save_status = await _capture_commercial_memory(user_id, message)
         if not commercial_save_status:
@@ -1583,6 +1584,15 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
                 "Commercial save was explicitly requested but no complete commercial "
                 "record could be extracted from this message."
             )
+        elif commercial_save_status.startswith("Commercial memory saved:"):
+            offer_id_match = re.search(r"offer_id=(\d+)", commercial_save_status)
+            newest_offer_id = int(offer_id_match.group(1)) if offer_id_match else None
+            guidance = await _commercial_offer_decision_guidance(
+                user_id,
+                supplier_id=int(deal["supplier_id"]),
+                newest_offer_id=newest_offer_id,
+            )
+            decision_guidance_status = _commercial_offer_decision_guidance_text(guidance)
 
     parts = [
         f"Supplier reply handoff recorded: deal_id={deal['id']}",
@@ -1597,6 +1607,8 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
 
     if commercial_save_status:
         parts.append(f"commercial_save_status={commercial_save_status}")
+        if decision_guidance_status:
+            parts.append(f"decision_guidance={decision_guidance_status}")
     else:
         parts.append(
             "Commercial terms in the reply were not saved because no explicit commercial save was requested"
@@ -2142,6 +2154,279 @@ async def _commercial_comparison_context(user_id: str, message: str) -> str:
 
 
 
+
+def _offer_decision_missing_fields(offer: dict):
+    watch = (
+        "price", "currency", "price_unit", "incoterm",
+        "moq", "payment_terms", "lead_time_days", "valid_until",
+    )
+    return [field for field in watch if offer.get(field) in (None, "")]
+
+
+def _offer_decision_same_text(a, b):
+    if a in (None, "") or b in (None, ""):
+        return None
+    return str(a).strip().casefold() == str(b).strip().casefold()
+
+
+def _offer_decision_same_number(a, b, tolerance=1e-9):
+    if a is None or b is None:
+        return None
+    try:
+        return abs(float(a) - float(b)) <= tolerance
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
+
+
+def _offer_decision_pick_previous(offers: list[dict], newest: dict):
+    candidates = [
+        item for item in offers
+        if item.get("id") != newest.get("id")
+        and item.get("supplier_id") == newest.get("supplier_id")
+    ]
+    if not candidates:
+        return None
+
+    newest_product = (newest.get("product") or "").strip().casefold()
+    newest_size = (newest.get("size") or "").strip().casefold()
+    same_product_size = []
+    for item in candidates:
+        product = (item.get("product") or "").strip().casefold()
+        size = (item.get("size") or "").strip().casefold()
+        product_ok = not newest_product or not product or product == newest_product
+        size_ok = not newest_size or not size or size == newest_size
+        if product_ok and size_ok:
+            same_product_size.append(item)
+
+    return (same_product_size or candidates)[0]
+
+
+async def _commercial_offer_decision_guidance(
+    user_id: str,
+    *,
+    supplier_id: int,
+    newest_offer_id: int | None = None,
+):
+    data = await get_commercial_offer_comparison(
+        user_id,
+        supplier_ids=[supplier_id],
+        latest_per_supplier=False,
+        limit=100,
+    )
+    offers = data.get("offers", [])
+    if not offers:
+        return None
+
+    newest = None
+    if newest_offer_id is not None:
+        newest = next((x for x in offers if x.get("id") == newest_offer_id), None)
+    if newest is None:
+        newest = offers[0]
+
+    previous = _offer_decision_pick_previous(offers, newest)
+    missing_new = _offer_decision_missing_fields(newest)
+
+    if previous is None:
+        decision = "REQUEST_CLARIFICATION" if missing_new else "FOLLOW_UP"
+        reason = (
+            "No earlier comparable saved offer exists for this supplier. "
+            + (
+                "Clarify the missing commercial terms before deciding."
+                if missing_new
+                else "Use this as the baseline and continue normal commercial follow-up."
+            )
+        )
+        return {
+            "decision": decision,
+            "confidence": "medium",
+            "new_offer_id": newest.get("id"),
+            "previous_offer_id": None,
+            "reason": reason,
+            "price_change": None,
+            "price_change_pct": None,
+            "missing_new": missing_new,
+        }
+
+    currency_same = _offer_decision_same_text(newest.get("currency"), previous.get("currency"))
+    unit_same = _offer_decision_same_text(newest.get("price_unit"), previous.get("price_unit"))
+    incoterm_same = _offer_decision_same_text(newest.get("incoterm"), previous.get("incoterm"))
+    product_same = _offer_decision_same_text(newest.get("product"), previous.get("product"))
+    size_same = _offer_decision_same_text(newest.get("size"), previous.get("size"))
+    thickness_same = _offer_decision_same_number(newest.get("thickness_mm"), previous.get("thickness_mm"))
+
+    spec_conflict = any(v is False for v in (product_same, size_same, thickness_same))
+
+    price_change = None
+    price_change_pct = None
+    if newest.get("price") is not None and previous.get("price") is not None:
+        try:
+            price_change = float(newest["price"]) - float(previous["price"])
+            if float(previous["price"]) != 0:
+                price_change_pct = (price_change / float(previous["price"])) * 100.0
+        except (TypeError, ValueError):
+            price_change = None
+            price_change_pct = None
+
+    if currency_same is not True or unit_same is not True:
+        decision = "REQUEST_CLARIFICATION"
+        confidence = "high"
+        reason = (
+            "The two saved prices are not on the same currency and price-unit basis, "
+            "so a direct price decision would be unreliable."
+        )
+    elif incoterm_same is not True:
+        decision = "REQUEST_CLARIFICATION"
+        confidence = "high"
+        reason = (
+            "The Incoterm basis is different or incomplete, so the quoted prices are "
+            "not safely comparable as equivalent commercial costs."
+        )
+    elif spec_conflict:
+        decision = "REQUEST_CLARIFICATION"
+        confidence = "high"
+        reason = (
+            "The saved product specifications differ between the two offers. "
+            "Confirm that the new quotation is for the same specification before deciding."
+        )
+    elif missing_new:
+        decision = "REQUEST_CLARIFICATION"
+        confidence = "high"
+        reason = (
+            "The new offer is missing material commercial terms: "
+            + ", ".join(missing_new)
+            + ". Clarify these before accepting or negotiating from the new offer."
+        )
+    elif price_change is None:
+        decision = "REQUEST_CLARIFICATION"
+        confidence = "medium"
+        reason = "A reliable saved price comparison is not available."
+    elif price_change < -1e-9:
+        decision = "ACCEPT"
+        confidence = "medium"
+        reason = (
+            "The new saved offer is lower on the same saved commercial basis and no tracked "
+            "critical offer field is missing. This is a recommendation only; it does not "
+            "accept the offer automatically."
+        )
+    elif price_change > 1e-9:
+        decision = "NEGOTIATE"
+        confidence = "high"
+        reason = (
+            "The new saved offer is higher on the same saved commercial basis. "
+            "Negotiate the price or request justification for the increase."
+        )
+    else:
+        decision = "NEGOTIATE"
+        confidence = "medium"
+        reason = (
+            "The saved price is unchanged on the same basis. Negotiate for an improvement "
+            "or another commercial concession before accepting."
+        )
+
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "new_offer_id": newest.get("id"),
+        "previous_offer_id": previous.get("id"),
+        "reason": reason,
+        "price_change": price_change,
+        "price_change_pct": price_change_pct,
+        "missing_new": missing_new,
+    }
+
+
+def _commercial_offer_decision_guidance_text(guidance: dict | None):
+    if not guidance:
+        return None
+    parts = [
+        f"decision={guidance.get('decision')}",
+        f"confidence={guidance.get('confidence')}",
+        f"new_offer_id={guidance.get('new_offer_id')}",
+    ]
+    if guidance.get("previous_offer_id") is not None:
+        parts.append(f"previous_offer_id={guidance.get('previous_offer_id')}")
+    if guidance.get("price_change") is not None:
+        parts.append(f"price_change={guidance.get('price_change'):.6g}")
+    if guidance.get("price_change_pct") is not None:
+        parts.append(f"price_change_pct={guidance.get('price_change_pct'):.4g}")
+    if guidance.get("missing_new"):
+        parts.append("missing_new=" + ",".join(guidance["missing_new"]))
+    parts.append("reason=" + str(guidance.get("reason") or "").replace(";", ","))
+    return "|".join(parts)
+
+
+def _is_offer_decision_guidance_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    decision_signals = (
+        "what should we do", "what do you recommend", "recommendation",
+        "accept", "negotiate", "clarify", "decision", "latest offer", "new offer",
+        "should we accept", "should i accept",
+        "was sollen wir tun", "empfehlung", "akzeptieren", "verhandeln",
+        "entscheidung", "neues angebot", "letztes angebot",
+        "ماذا تنصح", "ماذا نفعل", "ما القرار", "هل نقبل", "اقبل", "قبول",
+        "تفاوض", "نتفاوض", "توضيح", "العرض الجديد", "العرض الأخير", "العرض الاخير",
+    )
+    commercial_signals = (
+        "offer", "supplier", "price", "angebot", "lieferant", "preis",
+        "عرض", "مورد", "سعر",
+    )
+    return any(x in folded for x in decision_signals) and any(x in folded for x in commercial_signals)
+
+
+async def _commercial_offer_decision_guidance_context(user_id: str, message: str) -> str:
+    if not _is_offer_decision_guidance_request(message):
+        return ""
+
+    deal_id_match = re.search(
+        r"(?:الصفقة|صفقة|deal)\s*(?:رقم|#|id)?\s*[:#]?\s*(\d+)",
+        _deal_followup_ascii_digits(message or ""),
+        flags=re.IGNORECASE,
+    )
+
+    supplier_id = None
+    if deal_id_match:
+        deal = await get_commercial_deal_by_id(user_id, int(deal_id_match.group(1)))
+        if deal:
+            supplier_id = deal.get("supplier_id")
+
+    if supplier_id is None:
+        deals = await get_commercial_deals(user_id, active_only=True, limit=20)
+        if len(deals) == 1:
+            supplier_id = deals[0].get("supplier_id")
+
+    if supplier_id is None:
+        return (
+            "SMART OFFER DECISION GUIDANCE.\n"
+            "No unique active supplier/deal could be resolved. Ask the user to specify the deal ID or supplier."
+        )
+
+    guidance = await _commercial_offer_decision_guidance(
+        user_id,
+        supplier_id=int(supplier_id),
+    )
+    if not guidance:
+        return "SMART OFFER DECISION GUIDANCE.\nNo saved offer history was found."
+
+    lines = [
+        "SMART OFFER DECISION GUIDANCE.",
+        "This is advisory analysis only. Do not accept, reject, send, save, or change a deal automatically.",
+        "Use only saved commercial facts. Do not invent missing terms or user approval thresholds.",
+        f"Recommended action: {guidance['decision']}",
+        f"Confidence: {guidance['confidence']}",
+        f"New offer ID: {guidance['new_offer_id']}",
+    ]
+    if guidance.get("previous_offer_id") is not None:
+        lines.append(f"Previous offer ID: {guidance['previous_offer_id']}")
+    if guidance.get("price_change") is not None:
+        lines.append(f"Saved price change: {guidance['price_change']:.6g}")
+    if guidance.get("price_change_pct") is not None:
+        lines.append(f"Saved price change percent: {guidance['price_change_pct']:.4g}%")
+    if guidance.get("missing_new"):
+        lines.append("Missing in new saved offer: " + ", ".join(guidance["missing_new"]))
+    lines.append("Reason: " + guidance["reason"])
+    return "\n".join(lines)
+
+
 def _commercial_followup_action_queue_items(deals):
     """Build a deterministic read-only queue from saved active deals."""
     today = _deal_followup_today()
@@ -2361,6 +2646,30 @@ def _authoritative_memory_action_reply(memory_action: str | None):
                 "Commercial terms from the reply were not saved because you did not explicitly request that."
             )
 
+        decision_marker = "decision_guidance="
+        if decision_marker in memory_action:
+            raw = memory_action.split(decision_marker, 1)[1].rstrip(".")
+            values = {}
+            for token in raw.split("|"):
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    values[key] = value
+            if values.get("decision"):
+                parts.append(f"Advisory recommendation: {values['decision']}.")
+            if values.get("confidence"):
+                parts.append(f"Confidence: {values['confidence']}.")
+            if values.get("previous_offer_id"):
+                parts.append(f"Compared with saved offer ID: {values['previous_offer_id']}.")
+            if values.get("price_change") is not None:
+                change_text = f"Saved price change: {values['price_change']}"
+                if values.get("price_change_pct") is not None:
+                    change_text += f" ({values['price_change_pct']}%)."
+                else:
+                    change_text += "."
+                parts.append(change_text)
+            if values.get("reason"):
+                parts.append(values["reason"])
+
         return " ".join(parts)
 
     if memory_action.startswith("Commercial memory saved:"):
@@ -2409,6 +2718,9 @@ async def chat(req: ChatRequest):
     )
     persistent_context = await _persistent_context(req.user_id)
     comparison_context = await _commercial_comparison_context(req.user_id, req.message)
+    decision_guidance_context = await _commercial_offer_decision_guidance_context(
+        req.user_id, req.message
+    )
     memory_action_context = (
         f"Internal memory status for this turn: {memory_action}"
         if memory_action
@@ -2416,7 +2728,13 @@ async def chat(req: ChatRequest):
     )
     context_text = "\n\n".join(
         part
-        for part in [persistent_context, comparison_context, memory_action_context, recent_context]
+        for part in [
+            persistent_context,
+            comparison_context,
+            decision_guidance_context,
+            memory_action_context,
+            recent_context,
+        ]
         if part
     )
 
