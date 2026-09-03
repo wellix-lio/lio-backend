@@ -1497,6 +1497,286 @@ def _extract_supplier_reply_handoff_request(message: str):
     }
 
 
+
+
+def _clarification_normalize_date(raw):
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    match = re.match(
+        r"^(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})$|^(\d{1,2})[./](\d{1,2})[./](20\d{2})$",
+        raw,
+    )
+    if not match:
+        return None
+    if match.group(1):
+        return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    return f"{int(match.group(6)):04d}-{int(match.group(5)):02d}-{int(match.group(4)):02d}"
+
+
+def _extract_clarification_terms(message: str) -> dict:
+    values = {}
+    try:
+        record = _extract_commercial_record(message)
+    except Exception:
+        record = None
+
+    tracked = (
+        "product", "size", "thickness_mm", "price", "currency", "price_unit",
+        "quantity", "moq", "incoterm", "payment_terms", "quote_date",
+        "valid_until", "lead_time_days",
+    )
+    if record:
+        for field in tracked:
+            value = record.get(field)
+            if value not in (None, ""):
+                values[field] = value
+
+    if "moq" not in values:
+        m = re.search(
+            r"\bMOQ\b\s*[:=]?\s*([0-9٠-٩۰-۹]+(?:[.,][0-9٠-٩۰-۹]+)?)",
+            message or "",
+            flags=re.IGNORECASE,
+        )
+        if m:
+            values["moq"] = _commercial_number(m.group(1))
+
+    if "payment_terms" not in values:
+        payment = _first_match(
+            message or "",
+            [
+                r"(?:شروط\s+الدفع|الدفع)\s*[:=]?\s*(.+?)(?=[،,;\n]|$)",
+                r"\bpayment\s+terms?\s*[:=]?\s*(.+?)(?=[,;\n]|$)",
+                r"\bzahlungsbedingungen\s*[:=]?\s*(.+?)(?=[,;\n]|$)",
+            ],
+        )
+        if payment:
+            values["payment_terms"] = payment.strip()
+
+    if "lead_time_days" not in values:
+        m = re.search(
+            r"(?:lead\s*time|production\s+lead\s*time|delivery\s*time|"
+            r"مدة\s+التجهيز|مدة\s+التسليم|lieferzeit)\s*[:=]?\s*"
+            r"([0-9٠-٩۰-۹]+)\s*(?:days?|يوم|يوما|يومًا|tage?n?)\b",
+            message or "",
+            flags=re.IGNORECASE,
+        )
+        if m:
+            number = _commercial_number(m.group(1))
+            if number is not None:
+                values["lead_time_days"] = int(number)
+
+    if "valid_until" not in values:
+        m = re.search(
+            r"(?:valid\s+until|quote\s+valid\s+until|validity\s+until|"
+            r"صالح\s+حتى|صالح\s+لغاية|صلاحية\s+العرض\s+حتى|"
+            r"gültig\s+bis|gueltig\s+bis)\s*[:=]?\s*"
+            r"((?:20\d{2})[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[./]\d{1,2}[./](?:20\d{2}))",
+            message or "",
+            flags=re.IGNORECASE,
+        )
+        if m:
+            parsed = _clarification_normalize_date(m.group(1))
+            if parsed:
+                values["valid_until"] = parsed
+
+    if "incoterm" not in values:
+        m = re.search(r"\b(EXW|FOB|CIF|CFR|DDP|DAP|FCA)\b", message or "", flags=re.IGNORECASE)
+        if m:
+            values["incoterm"] = m.group(1).upper()
+
+    return {k: v for k, v in values.items() if v not in (None, "")}
+
+
+def _clarification_values_equal(a, b) -> bool:
+    if a in (None, "") and b in (None, ""):
+        return True
+    if a in (None, "") or b in (None, ""):
+        return False
+    try:
+        return abs(float(a) - float(b)) <= 1e-9
+    except (TypeError, ValueError):
+        return str(a).strip().casefold() == str(b).strip().casefold()
+
+
+async def _commercial_clarification_resolution_plan(user_id: str, deal: dict, message: str):
+    supplier_id = deal.get("supplier_id")
+    if supplier_id is None:
+        return None
+
+    guidance = await _commercial_offer_decision_guidance(
+        user_id,
+        supplier_id=int(supplier_id),
+    )
+    if not guidance or guidance.get("decision") != "REQUEST_CLARIFICATION":
+        return None
+
+    missing_before = list(guidance.get("missing_new") or [])
+    if not missing_before:
+        return None
+
+    data = await get_commercial_offer_comparison(
+        user_id,
+        supplier_ids=[int(supplier_id)],
+        latest_per_supplier=False,
+        limit=100,
+    )
+    offers = data.get("offers", [])
+    base_offer_id = guidance.get("new_offer_id")
+    base = next((x for x in offers if x.get("id") == base_offer_id), None)
+    if not base:
+        return None
+
+    extracted = _extract_clarification_terms(message)
+    resolved = [
+        field for field in missing_before
+        if field in extracted and extracted.get(field) not in (None, "")
+    ]
+
+    changed_existing = []
+    for field, value in extracted.items():
+        if field in missing_before:
+            continue
+        if field in base and base.get(field) not in (None, ""):
+            if not _clarification_values_equal(base.get(field), value):
+                changed_existing.append(field)
+
+    remaining = [field for field in missing_before if field not in resolved]
+    return {
+        "base": base,
+        "guidance_before": guidance,
+        "missing_before": missing_before,
+        "extracted": extracted,
+        "resolved": resolved,
+        "changed_existing": changed_existing,
+        "remaining": remaining,
+    }
+
+
+async def _save_commercial_clarification_resolution(user_id: str, deal: dict, plan: dict):
+    base = plan["base"]
+    extracted = plan.get("extracted") or {}
+    if not extracted:
+        return None
+
+    merged = {}
+    for field in (
+        "product", "size", "thickness_mm", "price", "currency", "price_unit",
+        "quantity", "moq", "incoterm", "payment_terms", "quote_date",
+        "valid_until", "lead_time_days",
+    ):
+        merged[field] = extracted.get(field, base.get(field))
+
+    supplier_id = int(deal["supplier_id"])
+    product_id = base.get("product_id")
+
+    if product_id is None and (
+        merged.get("product") or merged.get("size") or merged.get("thickness_mm") is not None
+    ):
+        product_name = merged.get("product") or "Commercial product"
+        existing_product = await find_exact_commercial_product(
+            user_id,
+            product_name,
+            supplier_id=supplier_id,
+            category=None,
+            size=merged.get("size"),
+            thickness_mm=merged.get("thickness_mm"),
+            finish=None,
+            color=None,
+            model=None,
+            notes=None,
+        )
+        if existing_product:
+            product_id = existing_product["id"]
+        else:
+            product_id = await add_commercial_product(
+                user_id,
+                product_name,
+                supplier_id=supplier_id,
+                size=merged.get("size"),
+                thickness_mm=merged.get("thickness_mm"),
+            )
+
+    notes = f"clarification_base_offer_id={base.get('id')}"
+
+    duplicate = await find_exact_commercial_offer(
+        user_id,
+        supplier_id=supplier_id,
+        product_id=product_id,
+        price=merged.get("price"),
+        currency=merged.get("currency"),
+        price_unit=merged.get("price_unit"),
+        quantity=merged.get("quantity"),
+        moq=merged.get("moq"),
+        incoterm=merged.get("incoterm"),
+        payment_terms=merged.get("payment_terms"),
+        quote_date=merged.get("quote_date"),
+        valid_until=merged.get("valid_until"),
+        lead_time_days=merged.get("lead_time_days"),
+        status="received",
+        source="clarification_resolution",
+        notes=notes,
+    )
+
+    if duplicate:
+        offer_id = duplicate["id"]
+        created = False
+    else:
+        offer_id = await add_commercial_offer(
+            user_id,
+            supplier_id=supplier_id,
+            product_id=product_id,
+            price=merged.get("price"),
+            currency=merged.get("currency"),
+            price_unit=merged.get("price_unit"),
+            quantity=merged.get("quantity"),
+            moq=merged.get("moq"),
+            incoterm=merged.get("incoterm"),
+            payment_terms=merged.get("payment_terms"),
+            quote_date=merged.get("quote_date"),
+            valid_until=merged.get("valid_until"),
+            lead_time_days=merged.get("lead_time_days"),
+            source="clarification_resolution",
+            notes=notes,
+        )
+        created = True
+
+    guidance_after = await _commercial_offer_decision_guidance(
+        user_id,
+        supplier_id=supplier_id,
+        newest_offer_id=offer_id,
+    )
+
+    return {
+        "offer_id": offer_id,
+        "created": created,
+        "guidance_after": guidance_after,
+        "merged": merged,
+    }
+
+
+def _commercial_clarification_resolution_text(plan: dict | None, result: dict | None = None):
+    if not plan:
+        return None
+
+    parts = [
+        f"base_offer_id={plan.get('base', {}).get('id')}",
+        "resolved=" + (",".join(plan.get("resolved") or []) or "none"),
+        "remaining=" + (",".join(plan.get("remaining") or []) or "none"),
+    ]
+    if plan.get("changed_existing"):
+        parts.append("changed_existing=" + ",".join(plan["changed_existing"]))
+
+    if result and result.get("offer_id") is not None:
+        parts.append(f"offer_id={result['offer_id']}")
+        parts.append("saved=true")
+        parts.append(f"created={'true' if result.get('created') else 'false'}")
+    else:
+        parts.append("saved=false")
+
+    return "|".join(parts)
+
+
 async def _capture_supplier_reply_handoff(user_id: str, message: str):
     request = _extract_supplier_reply_handoff_request(message)
     if not request:
@@ -1577,22 +1857,71 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
 
     commercial_save_status = None
     decision_guidance_status = None
+    clarification_resolution_status = None
+
+    clarification_plan = await _commercial_clarification_resolution_plan(
+        user_id, deal, message
+    )
+    if clarification_plan:
+        clarification_resolution_status = _commercial_clarification_resolution_text(
+            clarification_plan
+        )
+
     if request["explicit_commercial_save"]:
-        commercial_save_status = await _capture_commercial_memory(user_id, message)
-        if not commercial_save_status:
+        clarification_result = None
+
+        if clarification_plan and clarification_plan.get("extracted"):
+            clarification_result = await _save_commercial_clarification_resolution(
+                user_id, deal, clarification_plan
+            )
+
+        if clarification_result:
+            merged_product = (
+                clarification_result.get("merged", {}).get("product")
+                or "Commercial product"
+            )
+            if clarification_result.get("created"):
+                commercial_save_status = (
+                    "Commercial memory saved: "
+                    f"supplier={deal.get('supplier')}; product={merged_product}; "
+                    f"offer_id={clarification_result['offer_id']}"
+                )
+            else:
+                commercial_save_status = (
+                    "Commercial memory unchanged: exact offer already saved: "
+                    f"supplier={deal.get('supplier')}; product={merged_product}; "
+                    f"offer_id={clarification_result['offer_id']}"
+                )
+
+            clarification_resolution_status = _commercial_clarification_resolution_text(
+                clarification_plan, clarification_result
+            )
+            decision_guidance_status = _commercial_offer_decision_guidance_text(
+                clarification_result.get("guidance_after")
+            )
+
+        elif clarification_plan:
             commercial_save_status = (
-                "Commercial save was explicitly requested but no complete commercial "
-                "record could be extracted from this message."
+                "Commercial clarification save requested, but the supplier reply did not "
+                "resolve any tracked missing commercial field."
             )
-        elif commercial_save_status.startswith("Commercial memory saved:"):
-            offer_id_match = re.search(r"offer_id=(\d+)", commercial_save_status)
-            newest_offer_id = int(offer_id_match.group(1)) if offer_id_match else None
-            guidance = await _commercial_offer_decision_guidance(
-                user_id,
-                supplier_id=int(deal["supplier_id"]),
-                newest_offer_id=newest_offer_id,
-            )
-            decision_guidance_status = _commercial_offer_decision_guidance_text(guidance)
+
+        else:
+            commercial_save_status = await _capture_commercial_memory(user_id, message)
+            if not commercial_save_status:
+                commercial_save_status = (
+                    "Commercial save was explicitly requested but no complete commercial "
+                    "record could be extracted from this message."
+                )
+            elif commercial_save_status.startswith("Commercial memory saved:"):
+                offer_id_match = re.search(r"offer_id=(\d+)", commercial_save_status)
+                newest_offer_id = int(offer_id_match.group(1)) if offer_id_match else None
+                guidance = await _commercial_offer_decision_guidance(
+                    user_id,
+                    supplier_id=int(deal["supplier_id"]),
+                    newest_offer_id=newest_offer_id,
+                )
+                decision_guidance_status = _commercial_offer_decision_guidance_text(guidance)
 
     parts = [
         f"Supplier reply handoff recorded: deal_id={deal['id']}",
@@ -1607,9 +1936,13 @@ async def _capture_supplier_reply_handoff(user_id: str, message: str):
 
     if commercial_save_status:
         parts.append(f"commercial_save_status={commercial_save_status}")
+        if clarification_resolution_status:
+            parts.append(f"clarification_resolution={clarification_resolution_status}")
         if decision_guidance_status:
             parts.append(f"decision_guidance={decision_guidance_status}")
     else:
+        if clarification_resolution_status:
+            parts.append(f"clarification_resolution={clarification_resolution_status}")
         parts.append(
             "Commercial terms in the reply were not saved because no explicit commercial save was requested"
         )
@@ -2179,9 +2512,41 @@ def _offer_decision_same_number(a, b, tolerance=1e-9):
 
 
 def _offer_decision_pick_previous(offers: list[dict], newest: dict):
+    # Clarification snapshots form a chain:
+    # final clarification -> partial clarification -> original incomplete offer.
+    # None of those superseded snapshots should become the "previous commercial offer"
+    # used for price decision guidance.
+    offers_by_id = {
+        item.get("id"): item
+        for item in offers
+        if item.get("id") is not None
+    }
+
+    superseded_offer_ids = set()
+    current = newest
+    visited = set()
+
+    while current and current.get("id") not in visited:
+        current_id = current.get("id")
+        if current_id is not None:
+            visited.add(current_id)
+
+        notes = str(current.get("notes") or "")
+        superseded_match = re.search(
+            r"clarification_base_offer_id=(\d+)",
+            notes,
+        )
+        if not superseded_match:
+            break
+
+        superseded_id = int(superseded_match.group(1))
+        superseded_offer_ids.add(superseded_id)
+        current = offers_by_id.get(superseded_id)
+
     candidates = [
         item for item in offers
         if item.get("id") != newest.get("id")
+        and item.get("id") not in superseded_offer_ids
         and item.get("supplier_id") == newest.get("supplier_id")
     ]
     if not candidates:
@@ -2813,6 +3178,48 @@ def _authoritative_memory_action_reply(memory_action: str | None):
             parts.append(
                 "Commercial terms from the reply were not saved because you did not explicitly request that."
             )
+
+        clarification_marker = "clarification_resolution="
+        if clarification_marker in memory_action:
+            raw_clarification = memory_action.split(clarification_marker, 1)[1]
+            raw_clarification = raw_clarification.split(
+                "; decision_guidance=", 1
+            )[0].rstrip(".")
+
+            clarification_values = {}
+            for token in raw_clarification.split("|"):
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    clarification_values[key] = value
+
+            resolved = clarification_values.get("resolved")
+            remaining = clarification_values.get("remaining")
+            saved = clarification_values.get("saved") == "true"
+
+            if resolved and resolved != "none":
+                if saved:
+                    parts.append(
+                        "Supplier clarification was merged with the saved offer for: "
+                        + resolved.replace(",", ", ")
+                        + "."
+                    )
+                else:
+                    parts.append(
+                        "Supplier clarification appears to resolve: "
+                        + resolved.replace(",", ", ")
+                        + ", but those commercial facts were not saved because no explicit save was requested."
+                    )
+
+            if remaining and remaining != "none":
+                parts.append(
+                    "Still missing after this clarification: "
+                    + remaining.replace(",", ", ")
+                    + "."
+                )
+            elif saved and resolved and resolved != "none":
+                parts.append(
+                    "All previously tracked missing offer fields are now resolved."
+                )
 
         decision_marker = "decision_guidance="
         if decision_marker in memory_action:

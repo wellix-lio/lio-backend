@@ -130,6 +130,16 @@ RFQ and supplier-outreach rules:
 - A draft RFQ is not an external action. Never say it was sent unless an approved sending tool actually sends it after explicit user approval.
 
 
+
+Smart clarification reply resolution:
+- When a supplier answers previously requested missing offer terms, distinguish what was resolved from what is still missing.
+- A clarification reply may be partial. Carry forward only already-saved facts from the exact latest supplier offer and merge only facts explicitly present in the supplier's new reply.
+- Do not silently overwrite or invent commercial facts. If the supplier explicitly changes an already-saved term, treat the new explicit value as a revised supplier term and preserve the earlier offer in history.
+- Commercial clarification facts are persisted only when the user explicitly asks to save or record them.
+- After a saved clarification resolution, re-run offer decision guidance against the earlier comparable offer. A lower price is still not enough for ACCEPT if tracked material terms remain missing or the commercial basis is not comparable.
+- If some requested fields remain unanswered, keep REQUEST_CLARIFICATION and identify only the remaining missing fields.
+- Never accept, reject, send, close, or commit a deal automatically because clarification became complete.
+
 Smart decision-to-action handoff:
 - Treat ACCEPT / NEGOTIATE / REQUEST_CLARIFICATION / FOLLOW_UP as advisory decision guidance, not execution authority.
 - When the user asks for the next action or a supplier reply based on offer guidance, prepare the action without sending it or mutating commercial memory/deal state.
