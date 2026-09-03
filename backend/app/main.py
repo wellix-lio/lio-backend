@@ -3737,6 +3737,155 @@ async def _has_current_pi_approval_event(user_id: str, deal: dict) -> bool:
     )
 
 
+
+def _payment_record_number(value: str):
+    if value is None:
+        return None
+    text = _deal_followup_ascii_digits(str(value)).replace(' ', '')
+    if ',' in text and '.' in text:
+        if text.rfind(',') > text.rfind('.'):
+            text = text.replace('.', '').replace(',', '.')
+        else:
+            text = text.replace(',', '')
+    elif text.count(',') == 1:
+        left, right = text.split(',', 1)
+        text = left + right if len(right) == 3 else left + '.' + right
+    elif text.count('.') == 1:
+        left, right = text.split('.', 1)
+        text = left + right if len(right) == 3 else text
+    elif text.count(',') > 1:
+        text = text.replace(',', '')
+    elif text.count('.') > 1:
+        text = text.replace('.', '')
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_external_payment_record(message: str):
+    raw = _deal_followup_ascii_digits(message or '')
+    folded = raw.casefold()
+    past_signals = (
+        'i paid', 'we paid', 'payment made', 'payment was made',
+        'paid the supplier', 'paid supplier', 'deposit paid',
+        'i sent the payment', 'we sent the payment',
+        'دفعت', 'دفعنا', 'تم الدفع', 'تم دفع', 'قمنا بالدفع',
+        'حولت', 'حوّلت', 'تم التحويل', 'تم تحويل',
+        'ich habe bezahlt', 'wir haben bezahlt', 'zahlung erfolgt',
+        'zahlung wurde', 'anzahlung bezahlt', 'überwiesen', 'ueberwiesen',
+    )
+    if not any(x in folded for x in past_signals):
+        return None
+
+    deal_id = _acceptance_guard_deal_id(raw)
+    if deal_id is None:
+        return {'error': 'Payment record: not recorded. Specify the deal ID explicitly.'}
+
+    percent = None
+    pm = re.search(
+        r'([0-9]+(?:[.,][0-9]+)?)\s*(?:%|percent\b|prozent\b|بالمئة|بالمائة|في\s+المئة)',
+        raw, flags=re.IGNORECASE,
+    )
+    if pm:
+        percent = _commercial_number(pm.group(1))
+        if percent is None or not (0 < percent <= 100):
+            return {'error': 'Payment record: not recorded because the stated payment percentage is outside 0-100%.'}
+
+    amount = None
+    currency = None
+    currency_token = r'USD|US\$|\$|EUR|€|CNY|RMB|دولار(?:\s+أمريكي)?|يورو|يوان'
+    number_token = r'[0-9]+(?:[.,][0-9]+)*'
+    m1 = re.search(rf'({currency_token})\s*({number_token})', raw, flags=re.IGNORECASE)
+    m2 = re.search(rf'({number_token})\s*({currency_token})', raw, flags=re.IGNORECASE)
+    if m1 or m2:
+        if m1:
+            currency_raw, amount_raw = m1.group(1), m1.group(2)
+        else:
+            amount_raw, currency_raw = m2.group(1), m2.group(2)
+        amount = _payment_record_number(amount_raw)
+        currency = _extract_management_currency(currency_raw)
+        if amount is None or amount <= 0:
+            return {'error': 'Payment record: not recorded because the stated payment amount is invalid.'}
+
+    if amount is None and percent is None:
+        return {'error': ('Payment record: not recorded. State the payment amount and currency '
+                          'and/or the paid percentage explicitly; nothing will be inferred from payment terms.')}
+
+    fingerprint = 'text:' + hashlib.sha256((message or '').strip().encode('utf-8')).hexdigest()
+    return {'deal_id': int(deal_id), 'amount': amount, 'currency': currency,
+            'percent': percent, 'fingerprint': fingerprint}
+
+
+async def _has_payment_record_fingerprint(user_id: str, deal_id: int, fingerprint: str) -> bool:
+    events = await get_commercial_deal_events(user_id, int(deal_id), limit=200)
+    marker = f'fingerprint={fingerprint}'
+    return any(event.get('event_type') == 'payment_recorded'
+               and marker in str(event.get('summary') or '') for event in events)
+
+
+async def _capture_external_payment_record(user_id: str, message: str):
+    record = _extract_external_payment_record(message)
+    if not record:
+        return None
+    if record.get('error'):
+        return record['error']
+
+    deal_id = int(record['deal_id'])
+    deal = await get_commercial_deal_by_id(user_id, deal_id)
+    if not deal:
+        return f'Payment record: not recorded because deal #{deal_id} was not found.'
+    if not deal.get('is_active'):
+        return f'Payment record: not recorded because deal #{deal_id} is inactive/closed.'
+
+    if str(deal.get('status') or '') not in {'awaiting_pi', 'production', 'inspection', 'ready_to_ship'}:
+        return ('Payment record: not recorded because the deal is not in an active execution stage '
+                f"(current status={deal.get('status') or 'unknown'}).")
+
+    if not await _has_current_pi_approval_event(user_id, deal):
+        return ('Payment record: not recorded because the latest MATCH PI for the current '
+                'accepted offer does not have an explicit recorded PI approval.')
+
+    fingerprint = record['fingerprint']
+    if await _has_payment_record_fingerprint(user_id, deal_id, fingerprint):
+        return ('Payment record: this exact payment statement was already recorded for '
+                f'deal #{deal_id}; no duplicate payment event was created.')
+
+    changed = await update_commercial_deal(
+        user_id, deal_id, waiting_on='user',
+        next_action='Verify payment evidence / supplier receipt separately and decide the next execution step',
+        clear_next_action_due=bool(deal.get('next_action_due')),
+    )
+    if not changed:
+        return ('Payment record: not recorded because deal tracking could not be updated. '
+                'No payment or external action was executed.')
+
+    _, pi_payload = await _latest_pi_review_record(user_id, deal_id)
+    parts = [
+        'External payment reported by user',
+        f"offer_id={int(deal['offer_id'])}",
+        f"pi_fingerprint={pi_payload.get('fingerprint') if pi_payload else 'unknown'}",
+        f'fingerprint={fingerprint}',
+    ]
+    if record.get('amount') is not None:
+        parts.append(f"amount={record['amount']}")
+    if record.get('currency'):
+        parts.append(f"currency={record['currency']}")
+    if record.get('percent') is not None:
+        parts.append(f"percent={record['percent']}")
+
+    await add_commercial_deal_event(user_id, deal_id, 'payment_recorded', '; '.join(parts), source='user')
+
+    details = []
+    if record.get('amount') is not None:
+        details.append(f"amount={record['amount']} {record.get('currency') or 'currency-not-stated'}")
+    if record.get('percent') is not None:
+        details.append(f"percent={record['percent']}%")
+    return (f'Payment record: external payment reported by you was recorded internally for deal #{deal_id}; '
+            + '; '.join(details)
+            + '. This records your statement only; Lio did not execute or verify a bank transfer, '
+              'supplier receipt, production authorization, shipment release, or other external action.')
+
 async def _capture_pi_approval_payment_guardrails(user_id: str, message: str):
     approve_pi = _is_explicit_pi_approval_request(message)
     payment_request = _is_payment_execution_request(message)
@@ -3876,6 +4025,10 @@ async def _capture_user_memory(user_id: str, message: str):
     pi_review_action = await _capture_pi_review_text(user_id, message)
     if pi_review_action:
         return pi_review_action
+
+    payment_record_action = await _capture_external_payment_record(user_id, message)
+    if payment_record_action:
+        return payment_record_action
 
     pi_approval_payment_action = await _capture_pi_approval_payment_guardrails(
         user_id, message
@@ -4888,6 +5041,9 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("Payment guardrail:"):
         return memory_action.split("Payment guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Payment record:"):
+        return memory_action.split("Payment record:", 1)[1].strip()
 
     if memory_action.startswith("Commercial memory saved:"):
         details = memory_action.split("Commercial memory saved:", 1)[1].strip()

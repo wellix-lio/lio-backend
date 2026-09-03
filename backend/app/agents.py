@@ -203,7 +203,7 @@ async def run_pi_review_text(text: str) -> PIReviewExtraction:
 business_agent = Agent(
     name="Lio Business",
     model=OPENAI_DEFAULT_MODEL,
-    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + SUPPLIER_FOLLOWUP_DRAFTING_RULES + PI_REVIEW_RULES + PI_APPROVAL_PAYMENT_RULES + PI_APPROVAL_PAYMENT_RULES + """
+    instructions=BASE_RULES + DEAL_FOLLOWUP_CLARITY_RULES + SUPPLIER_FOLLOWUP_DRAFTING_RULES + PI_REVIEW_RULES + PI_APPROVAL_PAYMENT_RULES + """
 You specialize in commercial tasks: suppliers, offers, procurement, pricing,
 logistics, negotiation preparation, market comparison, and business analysis.
 
