@@ -2958,6 +2958,33 @@ async def _capture_acceptance_and_closing_guardrails(user_id: str, message: str)
                 "Accept the current offer explicitly first; the deal remains open."
             )
 
+        if str(deal.get("status") or "") != "ready_to_ship":
+            return (
+                "Deal closing guardrail: closure blocked because the deal has not reached "
+                f"ready_to_ship (current status={deal.get('status') or 'unknown'}). "
+                "Complete the execution, inspection, shipping-document, and shipment-release "
+                "guardrails first."
+            )
+
+        release_deal, pi_fingerprint, document_state_fingerprint, release_error = (
+            await _validate_shipment_release_approval(user_id, int(deal["id"]))
+        )
+        if release_error:
+            detail = str(release_error).replace("Shipment release:", "").strip()
+            return "Deal closing guardrail: closure blocked. " + detail
+
+        if not await _has_current_shipment_release_approval(
+            user_id,
+            release_deal,
+            pi_fingerprint,
+            document_state_fingerprint,
+        ):
+            return (
+                "Deal closing guardrail: closure blocked. A current internal shipment-release "
+                "approval tied to the current offer, PI, and shipping-document state is required "
+                "before the deal can be completed."
+            )
+
         changed = await update_commercial_deal(
             user_id,
             int(deal["id"]),
@@ -3307,8 +3334,8 @@ async def _capture_deal_tracking_by_id(user_id: str, message: str):
     if status == "completed":
         return (
             "Deal closing guardrail: completion not applied through status tracking. "
-            "Use the explicit deal-closing command after the current offer has an "
-            "explicit recorded acceptance."
+            "Use the explicit deal-closing command only after the deal has completed "
+            "the execution, inspection, shipping-document, and shipment-release guardrails."
         )
 
     if status == "cancelled":
@@ -3374,9 +3401,9 @@ async def _capture_deal_tracking(user_id: str, message: str):
     if status == "completed":
         return (
             "Deal closing guardrail: legacy completion wording was not applied. "
-            "To close a deal, use an explicit command with the deal ID after the "
-            "current offer has an explicit recorded acceptance, for example "
-            "'Close deal #4 as completed'."
+            "To close a deal, use an explicit command with the deal ID only after "
+            "the execution, inspection, shipping-document, and shipment-release guardrails "
+            "are complete, for example 'Close deal #4 as completed'."
         )
 
     if active_deals:
