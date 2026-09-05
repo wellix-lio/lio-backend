@@ -3232,6 +3232,14 @@ async def _execution_stage_transition_allowed(user_id: str, deal: dict, target_s
                 "recorded PI approval."
             )
 
+    if target_status == "ready_to_ship" and current_status == "inspection":
+        inspection_result = await _latest_current_inspection_result(user_id, deal)
+        if inspection_result != "PASS":
+            return False, (
+                "Execution-stage guardrail: ready-to-ship transition blocked because the current "
+                "offer and PI do not have a latest recorded inspection result of PASS."
+            )
+
     if target_rank < current_rank:
         return False, (
             "Execution-stage guardrail: backward execution-stage change blocked. "
@@ -3745,6 +3753,93 @@ async def _has_current_pi_approval_event(user_id: str, deal: dict) -> bool:
 
 
 
+def _extract_inspection_shipping_intent(message: str):
+    raw = _deal_followup_ascii_digits(message or "")
+    folded = raw.casefold()
+    deal_id = _acceptance_guard_deal_id(raw)
+
+    shipment_commands = (
+        "release shipment", "release the shipment", "authorize shipment",
+        "authorize shipping", "ship the goods", "ship the order",
+        "tell the supplier to ship", "tell supplier to ship",
+        "send shipment release", "shipment release",
+        "versand freigeben", "sendung freigeben",
+    )
+    inspection_pass = (
+        "inspection passed", "passed inspection", "inspection result pass",
+        "inspection result passed", "qc passed", "quality inspection passed",
+        "quality control passed", "inspektion bestanden",
+    )
+    inspection_fail = (
+        "inspection failed", "failed inspection", "inspection result fail",
+        "inspection result failed", "qc failed", "quality inspection failed",
+        "quality control failed", "inspektion fehlgeschlagen",
+    )
+    ready_signals = (
+        "supplier is ready to ship", "supplier ready to ship",
+        "goods are ready to ship", "order is ready to ship",
+        "shipment is ready to ship", "ready for shipment",
+        "versandbereit",
+    )
+
+    if any(signal in folded for signal in shipment_commands):
+        return {"kind": "shipment_command", "deal_id": int(deal_id) if deal_id is not None else None}
+    if any(signal in folded for signal in inspection_pass):
+        return {"kind": "inspection_result", "result": "PASS", "deal_id": int(deal_id) if deal_id is not None else None}
+    if any(signal in folded for signal in inspection_fail):
+        return {"kind": "inspection_result", "result": "FAIL", "deal_id": int(deal_id) if deal_id is not None else None}
+    if any(signal in folded for signal in ready_signals):
+        return {"kind": "ready_to_ship", "deal_id": int(deal_id) if deal_id is not None else None}
+    return None
+
+
+async def _latest_current_inspection_result(user_id: str, deal: dict):
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return None
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal["id"]))
+    if not pi_payload:
+        return None
+    pi_fingerprint = str(pi_payload.get("fingerprint") or "").strip()
+    if not pi_fingerprint:
+        return None
+    offer_marker = f"offer_id={int(offer_id)}"
+    pi_marker = f"pi_fingerprint={pi_fingerprint}"
+    events = await get_commercial_deal_events(user_id, int(deal["id"]), limit=200)
+    for event in reversed(events):
+        if event.get("event_type") != "inspection_result_recorded":
+            continue
+        summary = str(event.get("summary") or "")
+        if offer_marker not in summary or pi_marker not in summary:
+            continue
+        if "result=PASS" in summary:
+            return "PASS"
+        if "result=FAIL" in summary:
+            return "FAIL"
+    return None
+
+
+async def _has_current_ready_to_ship_event(user_id: str, deal: dict) -> bool:
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return False
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal["id"]))
+    if not pi_payload:
+        return False
+    pi_fingerprint = str(pi_payload.get("fingerprint") or "").strip()
+    if not pi_fingerprint:
+        return False
+    offer_marker = f"offer_id={int(offer_id)}"
+    pi_marker = f"pi_fingerprint={pi_fingerprint}"
+    events = await get_commercial_deal_events(user_id, int(deal["id"]), limit=200)
+    return any(
+        event.get("event_type") == "ready_to_ship_recorded"
+        and offer_marker in str(event.get("summary") or "")
+        and pi_marker in str(event.get("summary") or "")
+        for event in events
+    )
+
+
 def _extract_production_execution_intent(message: str):
     raw = _deal_followup_ascii_digits(message or "")
     folded = raw.casefold()
@@ -3875,6 +3970,178 @@ async def _has_payment_record_fingerprint(user_id: str, deal_id: int, fingerprin
     marker = f'fingerprint={fingerprint}'
     return any(event.get('event_type') == 'payment_recorded'
                and marker in str(event.get('summary') or '') for event in events)
+
+
+async def _capture_inspection_shipping(user_id: str, message: str):
+    intent = _extract_inspection_shipping_intent(message)
+    if not intent:
+        return None
+
+    deal_id = intent.get("deal_id")
+    if deal_id is None:
+        return "Inspection & shipping: action not applied. Specify the deal ID explicitly."
+
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        return f"Inspection & shipping: action not applied because deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        return f"Inspection & shipping: action not applied because deal #{deal_id} is inactive/closed."
+
+    kind = intent.get("kind")
+
+    if kind == "shipment_command":
+        inspection_result = await _latest_current_inspection_result(user_id, deal)
+        if inspection_result != "PASS":
+            return (
+                "Inspection & shipping: shipment release blocked because the current offer and PI "
+                "do not have a latest recorded inspection result of PASS. "
+                "No shipment release or supplier message was sent."
+            )
+        current_status = str(deal.get("status") or "")
+        if current_status != "ready_to_ship":
+            return (
+                "Inspection & shipping: shipment release blocked because the deal is not currently "
+                f"ready_to_ship (current status={current_status or 'unknown'}). "
+                "No external action was executed."
+            )
+        return (
+            "Inspection & shipping: no external shipment release was executed. "
+            "Lio does not release shipments or send supplier shipping commands in this stage; "
+            "a separately verified shipment-release workflow is required."
+        )
+
+    if kind == "inspection_result":
+        result = str(intent.get("result") or "").upper()
+        current_status = str(deal.get("status") or "")
+        if current_status not in {"production", "inspection"}:
+            return (
+                "Inspection & shipping: inspection result not recorded because the deal is not "
+                f"in production or inspection (current status={current_status or 'unknown'})."
+            )
+
+        latest_result = await _latest_current_inspection_result(user_id, deal)
+        if latest_result == result:
+            return (
+                f"Inspection & shipping: inspection result {result} is already the latest recorded "
+                f"result for deal #{deal_id}; no duplicate event was created."
+            )
+
+        allowed, error = await _execution_stage_transition_allowed(user_id, deal, "inspection")
+        if not allowed:
+            detail = str(error or "").replace("Execution-stage guardrail:", "").strip()
+            return "Inspection & shipping: inspection result not recorded. " + detail
+
+        _, pi_payload = await _latest_pi_review_record(user_id, int(deal_id))
+        pi_fingerprint = str((pi_payload or {}).get("fingerprint") or "").strip()
+        offer_id = deal.get("offer_id")
+        if offer_id is None or not pi_fingerprint:
+            return (
+                "Inspection & shipping: inspection result not recorded because current "
+                "offer / PI binding is unavailable."
+            )
+
+        next_action = (
+            "Confirm goods are ready to ship and verify shipping documents"
+            if result == "PASS"
+            else "Resolve inspection failures / corrective action before shipment readiness"
+        )
+        changed = await update_commercial_deal(
+            user_id,
+            int(deal_id),
+            status="inspection",
+            waiting_on="supplier",
+            next_action=next_action,
+            clear_next_action_due=bool(deal.get("next_action_due")),
+        )
+        if not changed:
+            return (
+                "Inspection & shipping: inspection result not recorded because deal tracking "
+                "could not be updated. No supplier message, shipment release, payment, or "
+                "other external action was executed."
+            )
+
+        await add_commercial_deal_event(
+            user_id,
+            int(deal_id),
+            "inspection_result_recorded",
+            (
+                "Inspection result recorded; "
+                f"offer_id={int(offer_id)}; pi_fingerprint={pi_fingerprint}; "
+                f"result={result}; status=inspection"
+            ),
+            source="user",
+        )
+        return (
+            f"Inspection & shipping: inspection result {result} recorded internally for "
+            f"deal #{deal_id}; status=inspection. This records the reported result only. "
+            "Lio did not contact the supplier, release a shipment, or execute any external action."
+        )
+
+    if kind == "ready_to_ship":
+        if await _has_current_ready_to_ship_event(user_id, deal):
+            return (
+                f"Inspection & shipping: ready-to-ship status is already recorded for "
+                f"deal #{deal_id} for the current offer and PI; no duplicate event was created."
+            )
+
+        inspection_result = await _latest_current_inspection_result(user_id, deal)
+        if inspection_result != "PASS":
+            return (
+                "Inspection & shipping: ready-to-ship status not recorded because the latest "
+                "inspection result for the current offer and PI is not PASS."
+            )
+
+        allowed, error = await _execution_stage_transition_allowed(
+            user_id, deal, "ready_to_ship"
+        )
+        if not allowed:
+            detail = str(error or "").replace("Execution-stage guardrail:", "").strip()
+            return "Inspection & shipping: ready-to-ship status not recorded. " + detail
+
+        _, pi_payload = await _latest_pi_review_record(user_id, int(deal_id))
+        pi_fingerprint = str((pi_payload or {}).get("fingerprint") or "").strip()
+        offer_id = deal.get("offer_id")
+        if offer_id is None or not pi_fingerprint:
+            return (
+                "Inspection & shipping: ready-to-ship status not recorded because current "
+                "offer / PI binding is unavailable."
+            )
+
+        changed = await update_commercial_deal(
+            user_id,
+            int(deal_id),
+            status="ready_to_ship",
+            waiting_on="user",
+            next_action=(
+                "Verify shipping documents and keep shipment release as a separate explicit workflow"
+            ),
+            clear_next_action_due=bool(deal.get("next_action_due")),
+        )
+        if not changed:
+            return (
+                "Inspection & shipping: ready-to-ship status not recorded because deal tracking "
+                "could not be updated. No shipment release, supplier message, payment, or other "
+                "external action was executed."
+            )
+
+        await add_commercial_deal_event(
+            user_id,
+            int(deal_id),
+            "ready_to_ship_recorded",
+            (
+                "Supplier-reported ready-to-ship status recorded; "
+                f"offer_id={int(offer_id)}; pi_fingerprint={pi_fingerprint}; "
+                "inspection_result=PASS; status=ready_to_ship"
+            ),
+            source="user",
+        )
+        return (
+            f"Inspection & shipping: supplier-reported ready-to-ship status recorded internally "
+            f"for deal #{deal_id}; status=ready_to_ship. No shipment was released and no "
+            "supplier shipping command was sent."
+        )
+
+    return None
 
 
 async def _capture_production_execution(user_id: str, message: str):
@@ -4153,6 +4420,10 @@ async def _capture_user_memory(user_id: str, message: str):
     pi_review_action = await _capture_pi_review_text(user_id, message)
     if pi_review_action:
         return pi_review_action
+
+    inspection_shipping_action = await _capture_inspection_shipping(user_id, message)
+    if inspection_shipping_action:
+        return inspection_shipping_action
 
     production_execution_action = await _capture_production_execution(user_id, message)
     if production_execution_action:
@@ -5173,6 +5444,9 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("Payment guardrail:"):
         return memory_action.split("Payment guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Inspection & shipping:"):
+        return memory_action.split("Inspection & shipping:", 1)[1].strip()
 
     if memory_action.startswith("Production execution:"):
         return memory_action.split("Production execution:", 1)[1].strip()
