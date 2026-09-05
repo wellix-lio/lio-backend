@@ -3840,6 +3840,240 @@ async def _has_current_ready_to_ship_event(user_id: str, deal: dict) -> bool:
     )
 
 
+def _normalize_shipping_document_type(value) -> str:
+    folded = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "commercial_invoice": "commercial_invoice",
+        "invoice": "commercial_invoice",
+        "packing_list": "packing_list",
+        "packinglist": "packing_list",
+        "bill_of_lading": "bill_of_lading",
+        "billoflading": "bill_of_lading",
+        "bl": "bill_of_lading",
+        "b_l": "bill_of_lading",
+        "certificate_of_origin": "certificate_of_origin",
+        "certificateoforigin": "certificate_of_origin",
+        "coo": "certificate_of_origin",
+        "other_shipping_document": "other_shipping_document",
+        "unknown": "unknown",
+    }
+    return aliases.get(folded, "unknown")
+
+
+def _compare_shipping_document_to_offer(offer: dict, document: dict) -> dict:
+    document_type = _normalize_shipping_document_type(document.get("document_type"))
+    checks = (
+        ("supplier", "supplier", False),
+        ("product", "product", False),
+        ("size", "size", False),
+        ("thickness_mm", "thickness_mm", True),
+        ("quantity", "quantity", True),
+        ("price", "unit_price", True),
+        ("currency", "currency", False),
+        ("incoterm", "incoterm", False),
+    )
+    mismatches = []
+    matched = []
+    for offer_field, document_field, numeric in checks:
+        saved_value = offer.get(offer_field)
+        document_value = document.get(document_field)
+        if saved_value is None or str(saved_value).strip() == "":
+            continue
+        if document_value is None or str(document_value).strip() == "":
+            continue
+        if _pi_values_equal(saved_value, document_value, numeric=numeric):
+            matched.append(document_field)
+        else:
+            mismatches.append(
+                {
+                    "field": document_field,
+                    "accepted_offer": saved_value,
+                    "shipping_document": document_value,
+                }
+            )
+
+    required_by_type = {
+        "commercial_invoice": ("supplier", "product", "quantity", "unit_price", "currency"),
+        "packing_list": ("product", "quantity"),
+        "bill_of_lading": ("bill_of_lading_number",),
+        "certificate_of_origin": ("product", "country_of_origin"),
+        "other_shipping_document": ("document_number",),
+    }
+    required = required_by_type.get(document_type, ())
+    missing = [
+        field
+        for field in required
+        if document.get(field) is None or str(document.get(field)).strip() == ""
+    ]
+    result = "DISCREPANCIES" if mismatches else ("INCOMPLETE" if missing else "MATCH")
+    return {
+        "result": result,
+        "document_type": document_type,
+        "matched": matched,
+        "mismatches": mismatches,
+        "missing": missing,
+    }
+
+
+def _parse_shipping_document_review_event_summary(summary: str | None):
+    prefix = "Shipping document review recorded; "
+    text = str(summary or "")
+    if not text.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(text[len(prefix):])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _has_shipping_document_fingerprint(user_id: str, deal_id: int, fingerprint: str) -> bool:
+    events = await get_commercial_deal_events(user_id, int(deal_id), limit=200)
+    for event in events:
+        if event.get("event_type") != "shipping_document_review_recorded":
+            continue
+        payload = _parse_shipping_document_review_event_summary(event.get("summary"))
+        if payload and str(payload.get("fingerprint") or "") == str(fingerprint or ""):
+            return True
+    return False
+
+
+async def _validate_shipping_document_review_deal(user_id: str, deal_id: int):
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        return None, None, None, f"Shipping documents: review not performed because deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        return None, None, None, f"Shipping documents: review not performed because deal #{deal_id} is inactive/closed."
+    if str(deal.get("status") or "") != "ready_to_ship":
+        return None, None, None, (
+            "Shipping documents: review blocked because the deal is not currently ready_to_ship "
+            f"(current status={deal.get('status') or 'unknown'})."
+        )
+    if not await _has_current_ready_to_ship_event(user_id, deal):
+        return None, None, None, (
+            "Shipping documents: review blocked because current ready-to-ship evidence is not recorded "
+            "for this offer and PI."
+        )
+    if await _latest_current_inspection_result(user_id, deal) != "PASS":
+        return None, None, None, (
+            "Shipping documents: review blocked because the latest inspection result for the current "
+            "offer and PI is not PASS."
+        )
+    if not await _has_current_pi_approval_event(user_id, deal):
+        return None, None, None, (
+            "Shipping documents: review blocked because the latest MATCH PI for the current accepted "
+            "offer does not have explicit recorded approval."
+        )
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return None, None, None, "Shipping documents: review blocked because the deal has no current saved offer."
+    offer = await get_commercial_offer_by_id(user_id, int(offer_id))
+    if not offer:
+        return None, None, None, f"Shipping documents: review blocked because current offer #{offer_id} was not found."
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal_id))
+    pi_fingerprint = str((pi_payload or {}).get("fingerprint") or "").strip()
+    try:
+        reviewed_offer_id = int((pi_payload or {}).get("offer_id"))
+    except (TypeError, ValueError):
+        reviewed_offer_id = None
+    if reviewed_offer_id != int(offer_id) or not pi_fingerprint:
+        return None, None, None, (
+            "Shipping documents: review blocked because current offer / PI binding is unavailable."
+        )
+    return deal, offer, pi_fingerprint, None
+
+
+def _shipping_document_next_action(result: str) -> str:
+    if result == "MATCH":
+        return "Review remaining shipping documents and keep shipment release as a separate explicit workflow"
+    if result == "DISCREPANCIES":
+        return "Resolve shipping document discrepancies before any shipment release"
+    return "Resolve missing shipping document details before any shipment release"
+
+
+async def _record_shipping_document_review(
+    user_id: str,
+    deal: dict,
+    offer: dict,
+    document: dict,
+    *,
+    pi_fingerprint: str,
+    fingerprint: str,
+    source: str,
+):
+    if await _has_shipping_document_fingerprint(user_id, int(deal["id"]), fingerprint):
+        return (
+            "Shipping documents: this exact shipping document file was already reviewed for "
+            f"deal #{deal['id']}; no duplicate event was created."
+        )
+    if not document.get("document_is_shipping_document"):
+        return (
+            "Shipping documents: review not recorded because the supplied file could not be reliably "
+            "identified as a shipping document."
+        )
+    document_type = _normalize_shipping_document_type(document.get("document_type"))
+    if document_type == "unknown":
+        return (
+            "Shipping documents: review not recorded because the shipping document type could not be "
+            "reliably identified."
+        )
+    comparison = _compare_shipping_document_to_offer(offer, document)
+    next_action = _shipping_document_next_action(comparison["result"])
+    changed = await update_commercial_deal(
+        user_id,
+        int(deal["id"]),
+        waiting_on="user",
+        next_action=next_action,
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return (
+            "Shipping documents: the document was extracted, but deal tracking could not be updated; "
+            "the document review was not recorded. No shipment release or other external action was executed."
+        )
+    event_payload = {
+        "offer_id": int(offer["id"]),
+        "pi_fingerprint": pi_fingerprint,
+        "fingerprint": fingerprint,
+        "document_type": document_type,
+        "document_number": document.get("document_number"),
+        "result": comparison["result"],
+        "mismatches": comparison["mismatches"],
+        "missing": comparison["missing"],
+        "bill_of_lading_number": document.get("bill_of_lading_number"),
+        "container_number": document.get("container_number"),
+        "seal_number": document.get("seal_number"),
+        "country_of_origin": document.get("country_of_origin"),
+    }
+    await add_commercial_deal_event(
+        user_id,
+        int(deal["id"]),
+        "shipping_document_review_recorded",
+        "Shipping document review recorded; "
+        + json.dumps(event_payload, ensure_ascii=False, separators=(",", ":")),
+        source=source,
+    )
+    parts = [
+        f"Shipping documents: {document_type} reviewed internally for deal #{deal['id']}.",
+        f"Result={comparison['result']}.",
+    ]
+    if document.get("document_number"):
+        parts.append(f"Document number: {document['document_number']}.")
+    if comparison["mismatches"]:
+        details = "; ".join(
+            f"{item['field']} accepted={item['accepted_offer']} document={item['shipping_document']}"
+            for item in comparison["mismatches"]
+        )
+        parts.append("Discrepancies: " + details + ".")
+    if comparison["missing"]:
+        parts.append("Missing/unverified in this document: " + ", ".join(comparison["missing"]) + ".")
+    parts.append("Deal status remains ready_to_ship.")
+    parts.append(
+        "This review does not release the shipment, contact the supplier, make a payment, or execute any external action."
+    )
+    return " ".join(parts)
+
+
 def _extract_production_execution_intent(message: str):
     raw = _deal_followup_ascii_digits(message or "")
     folded = raw.casefold()
@@ -5590,6 +5824,84 @@ async def review_pi_file(user_id: str, deal_id: int, file: UploadFile = File(...
     await add_message(user_id, "user", f"PI uploaded for review; deal_id={deal_id}; filename={filename}")
     await add_message(user_id, "assistant", authoritative_reply)
     return ChatResponse(reply=authoritative_reply, mode="live")
+
+@app.post("/shipping-documents/review", response_model=ChatResponse)
+async def review_shipping_document_file(user_id: str, deal_id: int, file: UploadFile = File(...)):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenAI API is not configured")
+    deal, offer, pi_fingerprint, error = await _validate_shipping_document_review_deal(
+        user_id, int(deal_id)
+    )
+    if error:
+        reply = _authoritative_memory_action_reply(error) or error
+        return ChatResponse(reply=reply, mode="live")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty shipping document file")
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Shipping document file is too large; maximum size is 20 MB",
+        )
+
+    filename = (file.filename or "shipping-document").strip() or "shipping-document"
+    mime_type = (file.content_type or "").lower().strip()
+    suffix = Path(filename).suffix.lower()
+    allowed_images = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    if mime_type == "application/pdf" or suffix == ".pdf":
+        mime_type = "application/pdf"
+    elif mime_type in allowed_images or suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        if mime_type not in allowed_images:
+            mime_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }[suffix]
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported shipping document file type. Use PDF, PNG, JPG/JPEG, or WEBP.",
+        )
+
+    fingerprint = "file:" + hashlib.sha256(data).hexdigest()
+    if await _has_shipping_document_fingerprint(user_id, int(deal_id), fingerprint):
+        reply = (
+            "Shipping documents: this exact shipping document file was already reviewed for "
+            f"deal #{deal_id}; no duplicate event was created."
+        )
+        return ChatResponse(reply=_authoritative_memory_action_reply(reply) or reply, mode="live")
+
+    encoded = base64.b64encode(data).decode("ascii")
+    file_data_url = f"data:{mime_type};base64,{encoded}"
+    try:
+        from .agents import run_shipping_document_review_file
+
+        extracted = await run_shipping_document_review_file(
+            file_data_url, filename, mime_type
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Shipping document extraction error: {exc}")
+
+    reply = await _record_shipping_document_review(
+        user_id,
+        deal,
+        offer,
+        extracted.model_dump(),
+        pi_fingerprint=pi_fingerprint,
+        fingerprint=fingerprint,
+        source="uploaded_file",
+    )
+    authoritative_reply = _authoritative_memory_action_reply(reply) or reply
+    await add_message(
+        user_id,
+        "user",
+        f"Shipping document uploaded for review; deal_id={deal_id}; filename={filename}",
+    )
+    await add_message(user_id, "assistant", authoritative_reply)
+    return ChatResponse(reply=authoritative_reply, mode="live")
+
 
 @app.post("/voice/transcribe")
 async def voice_transcribe(file: UploadFile = File(...)):

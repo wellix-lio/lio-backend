@@ -200,6 +200,99 @@ async def run_pi_review_text(text: str) -> PIReviewExtraction:
     return PIReviewExtraction.model_validate(output)
 
 
+class ShippingDocumentExtraction(BaseModel):
+    document_is_shipping_document: bool
+    document_type: str | None
+    document_number: str | None
+    document_date: str | None
+    supplier: str | None
+    buyer: str | None
+    product: str | None
+    size: str | None
+    thickness_mm: float | None
+    quantity: float | None
+    quantity_unit: str | None
+    unit_price: float | None
+    currency: str | None
+    total_amount: float | None
+    incoterm: str | None
+    loading_port: str | None
+    destination_port: str | None
+    bill_of_lading_number: str | None
+    container_number: str | None
+    seal_number: str | None
+    vessel_name: str | None
+    country_of_origin: str | None
+    packing: str | None
+    extraction_notes: str | None
+
+
+SHIPPING_DOCUMENT_REVIEW_RULES = '''
+You review shipping documents for an already-approved commercial deal.
+Extract only facts explicitly present in the supplied document.
+Do not use outside context to fill missing fields and do not infer unreadable values.
+Return null for fields that are absent or unreliable.
+
+Classify document_type as one of:
+- commercial_invoice
+- packing_list
+- bill_of_lading
+- certificate_of_origin
+- other_shipping_document
+- unknown
+
+A proforma invoice / PI by itself is not a shipping document for this workflow.
+Set document_is_shipping_document=false for a PI, unrelated file, or content that cannot
+be reliably identified as a shipping document.
+
+Never claim that document review authorizes shipment release, payment, supplier contact,
+customs filing, or any other external action.
+'''
+
+
+shipping_document_review_agent = Agent(
+    name="Lio Shipping Document Review",
+    model=OPENAI_DEFAULT_MODEL,
+    instructions=BASE_RULES + SHIPPING_DOCUMENT_REVIEW_RULES,
+    output_type=ShippingDocumentExtraction,
+)
+
+
+async def run_shipping_document_review_file(
+    file_data_url: str,
+    filename: str,
+    mime_type: str,
+) -> ShippingDocumentExtraction:
+    instruction = (
+        "Extract the factual contents of this shipping document. "
+        "Identify its document type carefully. Do not use outside context to fill missing "
+        "fields. Return null for anything not explicitly present or not reliably readable."
+    )
+    if (mime_type or "").lower().startswith("image/"):
+        content = [
+            {"type": "input_text", "text": instruction},
+            {"type": "input_image", "image_url": file_data_url, "detail": "high"},
+        ]
+    else:
+        content = [
+            {"type": "input_text", "text": instruction},
+            {
+                "type": "input_file",
+                "file_data": file_data_url,
+                "filename": filename,
+                "detail": "high",
+            },
+        ]
+
+    result = await Runner.run(
+        shipping_document_review_agent,
+        [{"role": "user", "content": content}],
+    )
+    output = result.final_output
+    if isinstance(output, ShippingDocumentExtraction):
+        return output
+    return ShippingDocumentExtraction.model_validate(output)
+
 business_agent = Agent(
     name="Lio Business",
     model=OPENAI_DEFAULT_MODEL,
