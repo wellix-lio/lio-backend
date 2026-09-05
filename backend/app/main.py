@@ -3402,6 +3402,13 @@ async def _capture_deal_tracking(user_id: str, message: str):
             f"supplier {supplier['name']}."
         )
 
+    if status in {"awaiting_pi", "production", "inspection", "ready_to_ship"}:
+        return (
+            "Execution-stage guardrail: no active deal exists for this supplier. "
+            "An execution-stage deal cannot be created directly; start from an existing deal "
+            "and follow acceptance, order handoff, PI review, and PI approval in sequence."
+        )
+
     latest = await get_latest_commercial_offer(user_id, supplier["id"])
     deal_id = await create_commercial_deal(
         user_id,
