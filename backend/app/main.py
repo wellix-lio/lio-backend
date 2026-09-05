@@ -4074,6 +4074,217 @@ async def _record_shipping_document_review(
     return " ".join(parts)
 
 
+
+def _extract_shipment_release_approval_intent(message: str):
+    raw = _deal_followup_ascii_digits(message or "")
+    folded = raw.casefold()
+    deal_id = _acceptance_guard_deal_id(raw)
+    approval_signals = (
+        "approve shipment release",
+        "approve the shipment release",
+        "record shipment release approval",
+        "record approval for shipment release",
+        "approve release of shipment",
+        "approve release for shipment",
+        "shipment release approved",
+        "shipping release approved",
+        "versandfreigabe genehmigen",
+        "versandfreigabe freigeben",
+    )
+    if any(signal in folded for signal in approval_signals):
+        return {"deal_id": int(deal_id) if deal_id is not None else None}
+    return None
+
+
+async def _latest_current_shipping_document_reviews(user_id: str, deal: dict) -> dict:
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return {}
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal["id"]))
+    pi_fingerprint = str((pi_payload or {}).get("fingerprint") or "").strip()
+    if not pi_fingerprint:
+        return {}
+
+    events = await get_commercial_deal_events(user_id, int(deal["id"]), limit=200)
+    latest = {}
+    for event in reversed(events):
+        if event.get("event_type") != "shipping_document_review_recorded":
+            continue
+        payload = _parse_shipping_document_review_event_summary(event.get("summary"))
+        if not payload:
+            continue
+        try:
+            payload_offer_id = int(payload.get("offer_id"))
+        except (TypeError, ValueError):
+            continue
+        if payload_offer_id != int(offer_id):
+            continue
+        if str(payload.get("pi_fingerprint") or "").strip() != pi_fingerprint:
+            continue
+        document_type = _normalize_shipping_document_type(payload.get("document_type"))
+        if document_type == "unknown" or document_type in latest:
+            continue
+        latest[document_type] = payload
+    return latest
+
+
+def _shipping_document_state_fingerprint(reviews: dict) -> str:
+    state = []
+    for document_type in sorted(reviews):
+        payload = reviews[document_type]
+        state.append({
+            "document_type": document_type,
+            "fingerprint": str(payload.get("fingerprint") or ""),
+            "result": str(payload.get("result") or "").upper(),
+        })
+    encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "docs:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+async def _validate_shipment_release_approval(user_id: str, deal_id: int):
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        return None, None, None, f"Shipment release: approval not recorded because deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        return None, None, None, f"Shipment release: approval not recorded because deal #{deal_id} is inactive/closed."
+    if str(deal.get("status") or "") != "ready_to_ship":
+        return None, None, None, (
+            "Shipment release: approval blocked because the deal is not currently ready_to_ship "
+            f"(current status={deal.get('status') or 'unknown'})."
+        )
+    if not await _has_current_ready_to_ship_event(user_id, deal):
+        return None, None, None, (
+            "Shipment release: approval blocked because current ready-to-ship evidence is not recorded "
+            "for this offer and PI."
+        )
+    if await _latest_current_inspection_result(user_id, deal) != "PASS":
+        return None, None, None, (
+            "Shipment release: approval blocked because the latest inspection result for the current "
+            "offer and PI is not PASS."
+        )
+    if not await _has_current_pi_approval_event(user_id, deal):
+        return None, None, None, (
+            "Shipment release: approval blocked because the latest MATCH PI for the current accepted "
+            "offer does not have explicit recorded approval."
+        )
+
+    offer_id = deal.get("offer_id")
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal_id))
+    pi_fingerprint = str((pi_payload or {}).get("fingerprint") or "").strip()
+    try:
+        reviewed_offer_id = int((pi_payload or {}).get("offer_id"))
+    except (TypeError, ValueError):
+        reviewed_offer_id = None
+    if offer_id is None or reviewed_offer_id != int(offer_id) or not pi_fingerprint:
+        return None, None, None, (
+            "Shipment release: approval blocked because current offer / PI binding is unavailable."
+        )
+
+    reviews = await _latest_current_shipping_document_reviews(user_id, deal)
+    required_types = ("commercial_invoice", "packing_list")
+    missing_types = [t for t in required_types if t not in reviews]
+    if missing_types:
+        return None, None, None, (
+            "Shipment release: approval blocked because required current shipping document reviews are missing: "
+            + ", ".join(missing_types) + "."
+        )
+
+    blocking = []
+    for document_type, payload in sorted(reviews.items()):
+        result = str(payload.get("result") or "").upper()
+        if result != "MATCH":
+            blocking.append(f"{document_type}={result or 'UNKNOWN'}")
+    if blocking:
+        return None, None, None, (
+            "Shipment release: approval blocked because current shipping document review results are not all MATCH: "
+            + ", ".join(blocking) + "."
+        )
+
+    state_fingerprint = _shipping_document_state_fingerprint(reviews)
+    return deal, pi_fingerprint, state_fingerprint, None
+
+
+async def _has_current_shipment_release_approval(
+    user_id: str,
+    deal: dict,
+    pi_fingerprint: str,
+    document_state_fingerprint: str,
+) -> bool:
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return False
+    offer_marker = f"offer_id={int(offer_id)}"
+    pi_marker = f"pi_fingerprint={pi_fingerprint}"
+    docs_marker = f"document_state_fingerprint={document_state_fingerprint}"
+    events = await get_commercial_deal_events(user_id, int(deal["id"]), limit=200)
+    return any(
+        event.get("event_type") == "shipment_release_approved"
+        and offer_marker in str(event.get("summary") or "")
+        and pi_marker in str(event.get("summary") or "")
+        and docs_marker in str(event.get("summary") or "")
+        for event in events
+    )
+
+
+async def _capture_shipment_release_approval(user_id: str, message: str):
+    intent = _extract_shipment_release_approval_intent(message)
+    if not intent:
+        return None
+
+    deal_id = intent.get("deal_id")
+    if deal_id is None:
+        return (
+            "Shipment release: approval not recorded. Specify the deal ID explicitly, for example "
+            "'Approve shipment release for deal #12'."
+        )
+
+    deal, pi_fingerprint, document_state_fingerprint, error = await _validate_shipment_release_approval(
+        user_id, int(deal_id)
+    )
+    if error:
+        return error
+
+    if await _has_current_shipment_release_approval(
+        user_id, deal, pi_fingerprint, document_state_fingerprint
+    ):
+        return (
+            f"Shipment release: internal shipment-release approval is already recorded for deal #{deal_id} "
+            "for the current offer, PI, and shipping-document state; no duplicate event was created."
+        )
+
+    changed = await update_commercial_deal(
+        user_id,
+        int(deal_id),
+        waiting_on="user",
+        next_action=(
+            "Shipment release approved internally; execute any external release only through a separately verified workflow"
+        ),
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return (
+            "Shipment release: approval not recorded because deal tracking could not be updated. "
+            "No shipment release, supplier message, or other external action was executed."
+        )
+
+    await add_commercial_deal_event(
+        user_id,
+        int(deal_id),
+        "shipment_release_approved",
+        (
+            "Internal shipment-release approval recorded; "
+            f"offer_id={int(deal['offer_id'])}; pi_fingerprint={pi_fingerprint}; "
+            f"document_state_fingerprint={document_state_fingerprint}; status=ready_to_ship"
+        ),
+        source="user",
+    )
+    return (
+        f"Shipment release: internal shipment-release approval recorded for deal #{deal_id}. "
+        "Deal status remains ready_to_ship. This approval does not release the shipment, contact the supplier, "
+        "or execute any external action; external shipment release requires a separately verified workflow."
+    )
+
+
 def _extract_production_execution_intent(message: str):
     raw = _deal_followup_ascii_digits(message or "")
     folded = raw.casefold()
@@ -4654,6 +4865,10 @@ async def _capture_user_memory(user_id: str, message: str):
     pi_review_action = await _capture_pi_review_text(user_id, message)
     if pi_review_action:
         return pi_review_action
+
+    shipment_release_action = await _capture_shipment_release_approval(user_id, message)
+    if shipment_release_action:
+        return shipment_release_action
 
     inspection_shipping_action = await _capture_inspection_shipping(user_id, message)
     if inspection_shipping_action:
@@ -5678,6 +5893,12 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("Payment guardrail:"):
         return memory_action.split("Payment guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Shipping documents:"):
+        return memory_action.split("Shipping documents:", 1)[1].strip()
+
+    if memory_action.startswith("Shipment release:"):
+        return memory_action.split("Shipment release:", 1)[1].strip()
 
     if memory_action.startswith("Inspection & shipping:"):
         return memory_action.split("Inspection & shipping:", 1)[1].strip()
