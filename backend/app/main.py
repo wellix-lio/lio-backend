@@ -3745,6 +3745,52 @@ async def _has_current_pi_approval_event(user_id: str, deal: dict) -> bool:
 
 
 
+def _extract_production_execution_intent(message: str):
+    raw = _deal_followup_ascii_digits(message or "")
+    folded = raw.casefold()
+    deal_id = _acceptance_guard_deal_id(raw)
+
+    external_commands = (
+        "authorize production", "approve production", "start production", "begin production",
+        "tell the supplier to start production", "tell supplier to start production",
+        "send production authorization", "production authorization",
+        "produktion freigeben", "produktion starten",
+    )
+    factual_signals = (
+        "supplier started production", "supplier has started production",
+        "production started", "production has started",
+        "supplier confirmed production started", "supplier confirmed production has started",
+        "produktion hat begonnen", "produktion wurde gestartet",
+    )
+
+    if any(signal in folded for signal in external_commands):
+        return {"kind": "command", "deal_id": int(deal_id) if deal_id is not None else None}
+    if any(signal in folded for signal in factual_signals):
+        return {"kind": "record", "deal_id": int(deal_id) if deal_id is not None else None}
+    return None
+
+
+async def _has_current_production_started_event(user_id: str, deal: dict) -> bool:
+    offer_id = deal.get("offer_id")
+    if offer_id is None:
+        return False
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal["id"]))
+    if not pi_payload:
+        return False
+    pi_fingerprint = str(pi_payload.get("fingerprint") or "").strip()
+    if not pi_fingerprint:
+        return False
+    events = await get_commercial_deal_events(user_id, int(deal["id"]), limit=200)
+    offer_marker = f"offer_id={int(offer_id)}"
+    pi_marker = f"pi_fingerprint={pi_fingerprint}"
+    return any(
+        event.get("event_type") == "production_started_recorded"
+        and offer_marker in str(event.get("summary") or "")
+        and pi_marker in str(event.get("summary") or "")
+        for event in events
+    )
+
+
 def _payment_record_number(value: str):
     if value is None:
         return None
@@ -3829,6 +3875,81 @@ async def _has_payment_record_fingerprint(user_id: str, deal_id: int, fingerprin
     marker = f'fingerprint={fingerprint}'
     return any(event.get('event_type') == 'payment_recorded'
                and marker in str(event.get('summary') or '') for event in events)
+
+
+async def _capture_production_execution(user_id: str, message: str):
+    intent = _extract_production_execution_intent(message)
+    if not intent:
+        return None
+
+    deal_id = intent.get("deal_id")
+    if deal_id is None:
+        return "Production execution: action not applied. Specify the deal ID explicitly."
+
+    deal = await get_commercial_deal_by_id(user_id, int(deal_id))
+    if not deal:
+        return f"Production execution: action not applied because deal #{deal_id} was not found."
+    if not deal.get("is_active"):
+        return f"Production execution: action not applied because deal #{deal_id} is inactive/closed."
+
+    if intent.get("kind") == "command":
+        if not await _has_current_pi_approval_event(user_id, deal):
+            return (
+                "Production execution: external production authorization blocked because the latest "
+                "MATCH PI for the current accepted offer does not have an explicit recorded PI approval. "
+                "No supplier message or production command was sent."
+            )
+        return (
+            "Production execution: no external production authorization was executed. "
+            "Lio does not send supplier production commands in this stage; a separately verified "
+            "external production-authorization workflow is required."
+        )
+
+    if await _has_current_production_started_event(user_id, deal):
+        return (
+            f"Production execution: production start is already recorded for deal #{deal_id} "
+            "for the current offer and PI; no duplicate event was created."
+        )
+
+    allowed, error = await _execution_stage_transition_allowed(user_id, deal, "production")
+    if not allowed:
+        detail = str(error or "").replace("Execution-stage guardrail:", "").strip()
+        return "Production execution: production start not recorded. " + detail
+
+    _, pi_payload = await _latest_pi_review_record(user_id, int(deal_id))
+    pi_fingerprint = str((pi_payload or {}).get("fingerprint") or "").strip()
+    offer_id = deal.get("offer_id")
+
+    changed = await update_commercial_deal(
+        user_id,
+        int(deal_id),
+        status="production",
+        waiting_on="supplier",
+        next_action="Monitor production progress and the agreed lead time",
+        clear_next_action_due=bool(deal.get("next_action_due")),
+    )
+    if not changed:
+        return (
+            "Production execution: production start not recorded because deal tracking could not be updated. "
+            "No supplier message, production command, payment, or other external action was executed."
+        )
+
+    await add_commercial_deal_event(
+        user_id,
+        int(deal_id),
+        "production_started_recorded",
+        (
+            "Supplier-reported production start recorded; "
+            f"offer_id={int(offer_id)}; pi_fingerprint={pi_fingerprint}; status=production"
+        ),
+        source="user",
+    )
+
+    return (
+        f"Production execution: supplier-reported production start recorded internally for deal #{deal_id}; "
+        "status=production. This records the reported external fact only. Lio did not send a supplier "
+        "message, authorize or start production externally, execute a payment, or release a shipment."
+    )
 
 
 async def _capture_external_payment_record(user_id: str, message: str):
@@ -4032,6 +4153,10 @@ async def _capture_user_memory(user_id: str, message: str):
     pi_review_action = await _capture_pi_review_text(user_id, message)
     if pi_review_action:
         return pi_review_action
+
+    production_execution_action = await _capture_production_execution(user_id, message)
+    if production_execution_action:
+        return production_execution_action
 
     payment_record_action = await _capture_external_payment_record(user_id, message)
     if payment_record_action:
@@ -5048,6 +5173,9 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("Payment guardrail:"):
         return memory_action.split("Payment guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Production execution:"):
+        return memory_action.split("Production execution:", 1)[1].strip()
 
     if memory_action.startswith("Payment record:"):
         return memory_action.split("Payment record:", 1)[1].strip()
