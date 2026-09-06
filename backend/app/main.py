@@ -3460,8 +3460,9 @@ async def _capture_deal_tracking_by_id(user_id: str, message: str):
 
     if status == "cancelled":
         return (
-            "Deal tracking not applied: cancellation requires a separate explicit "
-            "cancellation workflow; no status change was made."
+            "Deal cancellation guardrail: cancellation not applied through status tracking. "
+            "Use the explicit cancellation command with the deal ID, for example "
+            "'Cancel deal #4'. No status change was made."
         )
 
     execution_allowed, execution_error = await _execution_stage_transition_allowed(
