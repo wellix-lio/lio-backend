@@ -3526,6 +3526,13 @@ async def _capture_deal_tracking(user_id: str, message: str):
             "are complete, for example 'Close deal #4 as completed'."
         )
 
+    if status == "cancelled":
+        return (
+            "Deal cancellation guardrail: legacy cancellation wording was not applied. "
+            "To cancel a deal, use an explicit command with the deal ID, for example "
+            "'Cancel deal #4'."
+        )
+
     if active_deals:
         deal = active_deals[0]
 
