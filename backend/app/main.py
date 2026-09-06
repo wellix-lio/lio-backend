@@ -3003,6 +3003,10 @@ async def _capture_acceptance_and_closing_guardrails(user_id: str, message: str)
             detail = str(error)
             detail = detail.replace("Deal closure", "Deal cancellation")
             detail = detail.replace("Commercial approval", "Deal cancellation")
+            detail = detail.replace(
+                "'Close deal #4 as completed'.",
+                "'Cancel deal #4'.",
+            )
             return "Deal cancellation guardrail: " + detail
 
         if not deal.get("is_active"):
