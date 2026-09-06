@@ -2881,6 +2881,62 @@ def _is_explicit_deal_close_request(message: str) -> bool:
     return any(x in folded for x in strong)
 
 
+def _is_explicit_deal_cancel_request(message: str) -> bool:
+    folded = (message or "").casefold().strip()
+
+    blocked = (
+        "do not cancel",
+        "don't cancel",
+        "dont cancel",
+        "can i cancel",
+        "could i cancel",
+        "should i cancel",
+        "how to cancel",
+        "what happens if i cancel",
+        "nicht stornieren",
+        "nicht abbrechen",
+        "kann ich",
+        "soll ich",
+        "wie kann ich",
+        "لا تلغ",
+        "لا تُلغ",
+        "لا تلغي",
+        "هل يمكن",
+        "هل أستطيع",
+        "هل استطيع",
+        "كيف ألغي",
+        "كيف الغي",
+    )
+    if any(x in folded for x in blocked):
+        return False
+
+    strong = (
+        "cancel deal",
+        "cancel the deal",
+        "cancel this deal",
+        "mark deal as cancelled",
+        "mark deal as canceled",
+        "mark the deal as cancelled",
+        "mark the deal as canceled",
+        "record deal as cancelled",
+        "record deal as canceled",
+        "record the deal as cancelled",
+        "record the deal as canceled",
+        "storniere deal",
+        "deal stornieren",
+        "deal abbrechen",
+        "deal als storniert markieren",
+        "deal als abgebrochen markieren",
+        "ألغ الصفقة",
+        "الغ الصفقة",
+        "إلغاء الصفقة",
+        "سجل الصفقة ملغاة",
+        "سجّل الصفقة ملغاة",
+        "اعتبر الصفقة ملغاة",
+    )
+    return any(x in folded for x in strong)
+
+
 async def _resolve_acceptance_guard_deal(
     user_id: str,
     message: str,
@@ -2932,9 +2988,69 @@ async def _has_current_offer_acceptance_event(user_id: str, deal: dict) -> bool:
 async def _capture_acceptance_and_closing_guardrails(user_id: str, message: str):
     explicit_accept = _is_explicit_offer_acceptance_request(message)
     explicit_close = _is_explicit_deal_close_request(message)
+    explicit_cancel = _is_explicit_deal_cancel_request(message)
 
-    if not explicit_accept and not explicit_close:
+    if not explicit_accept and not explicit_close and not explicit_cancel:
         return None
+
+    if explicit_cancel:
+        deal, error = await _resolve_acceptance_guard_deal(
+            user_id,
+            message,
+            require_explicit_id=True,
+        )
+        if error:
+            detail = str(error)
+            detail = detail.replace("Deal closure", "Deal cancellation")
+            detail = detail.replace("Commercial approval", "Deal cancellation")
+            return "Deal cancellation guardrail: " + detail
+
+        if not deal.get("is_active"):
+            if str(deal.get("status") or "") == "cancelled":
+                return (
+                    "Deal cancellation guardrail: deal #%s is already cancelled; "
+                    "no duplicate cancellation event was recorded."
+                    % deal["id"]
+                )
+            return (
+                "Deal cancellation guardrail: deal #%s is already inactive/closed; "
+                "no status change was made."
+                % deal["id"]
+            )
+
+        previous_status = str(deal.get("status") or "")
+        changed = await update_commercial_deal(
+            user_id,
+            int(deal["id"]),
+            status="cancelled",
+            waiting_on="none",
+            next_action="No further action",
+            clear_next_action_due=bool(deal.get("next_action_due")),
+        )
+        if not changed:
+            return (
+                "Deal cancellation guardrail: cancellation failed; "
+                "no status change was recorded."
+            )
+
+        await add_commercial_deal_event(
+            user_id,
+            int(deal["id"]),
+            "deal_cancelled_explicitly",
+            (
+                f"Explicit deal cancellation approved by user; "
+                f"offer_id={deal.get('offer_id')}; previous_status={previous_status}; "
+                "status=cancelled"
+            ),
+            source="user",
+        )
+        return (
+            "Deal cancellation guardrail: deal cancelled explicitly; "
+            f"deal_id={deal['id']}; offer_id={deal.get('offer_id')}; "
+            f"previous_status={previous_status}; status=cancelled. "
+            "This was an internal deal-status change only; no supplier message, payment, "
+            "shipment release, or other external action was executed."
+        )
 
     if explicit_close:
         deal, error = await _resolve_acceptance_guard_deal(
@@ -5905,6 +6021,9 @@ def _authoritative_memory_action_reply(memory_action: str | None):
 
     if memory_action.startswith("Deal closing guardrail:"):
         return memory_action.split("Deal closing guardrail:", 1)[1].strip()
+
+    if memory_action.startswith("Deal cancellation guardrail:"):
+        return memory_action.split("Deal cancellation guardrail:", 1)[1].strip()
 
     if memory_action.startswith("Order execution handoff guardrail:"):
         return memory_action.split("Order execution handoff guardrail:", 1)[1].strip()
