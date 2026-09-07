@@ -11,7 +11,7 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .config import OPENAI_API_KEY, LIO_ALLOWED_ORIGINS, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET, WHATSAPP_GRAPH_API_VERSION
-from .whatsapp import verify_whatsapp_subscription, verify_whatsapp_signature, extract_whatsapp_messages, download_whatsapp_media
+from .whatsapp import verify_whatsapp_subscription, verify_whatsapp_signature, extract_whatsapp_messages, download_whatsapp_media, send_whatsapp_text
 from .voice import transcribe_audio
 from .memory import (
     init_db,
@@ -40,6 +40,14 @@ from .memory import (
     claim_whatsapp_inbound_message,
     complete_whatsapp_inbound_message,
     fail_whatsapp_inbound_message,
+    create_whatsapp_outbound_draft,
+    get_whatsapp_outbound_message,
+    list_whatsapp_outbound_messages,
+    approve_whatsapp_outbound_message,
+    reject_whatsapp_outbound_message,
+    claim_approved_whatsapp_outbound_message,
+    complete_whatsapp_outbound_send,
+    fail_whatsapp_outbound_send,
     get_commercial_offer_by_id,
     get_latest_commercial_offer,
     update_commercial_supplier,
@@ -6403,6 +6411,115 @@ async def _process_whatsapp_inbound_message(message: dict):
 
     except Exception as exc:
         await fail_whatsapp_inbound_message(user_id, message_id, str(exc))
+
+
+
+class WhatsAppDraftRequest(BaseModel):
+    user_id: str = "owner"
+    to_phone: str = Field(min_length=5, max_length=40)
+    body: str = Field(min_length=1, max_length=4000)
+    supplier_id: int | None = None
+    source_message_id: str | None = Field(default=None, max_length=300)
+
+
+@app.post("/whatsapp/outbound/draft")
+async def whatsapp_outbound_create_draft(req: WhatsAppDraftRequest):
+    outbound_id = await create_whatsapp_outbound_draft(
+        user_id=req.user_id,
+        to_phone=req.to_phone,
+        body=req.body,
+        supplier_id=req.supplier_id,
+        source_message_id=req.source_message_id,
+    )
+    item = await get_whatsapp_outbound_message(req.user_id, outbound_id)
+    return {"status": "pending_approval", "item": item}
+
+
+@app.get("/whatsapp/outbound/{user_id}")
+async def whatsapp_outbound_list(
+    user_id: str,
+    status: str | None = None,
+    limit: int = 50,
+):
+    items = await list_whatsapp_outbound_messages(
+        user_id=user_id,
+        status=status,
+        limit=limit,
+    )
+    return {"items": items}
+
+
+@app.post("/whatsapp/outbound/{outbound_id}/approve")
+async def whatsapp_outbound_approve(outbound_id: int, user_id: str = "owner"):
+    approved = await approve_whatsapp_outbound_message(user_id, outbound_id)
+    if not approved:
+        item = await get_whatsapp_outbound_message(user_id, outbound_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="WhatsApp outbound draft not found")
+        raise HTTPException(
+            status_code=409,
+            detail=f"WhatsApp outbound draft cannot be approved from status: {item['status']}",
+        )
+    item = await get_whatsapp_outbound_message(user_id, outbound_id)
+    return {"status": "approved", "item": item}
+
+
+@app.post("/whatsapp/outbound/{outbound_id}/reject")
+async def whatsapp_outbound_reject(outbound_id: int, user_id: str = "owner"):
+    rejected = await reject_whatsapp_outbound_message(user_id, outbound_id)
+    if not rejected:
+        item = await get_whatsapp_outbound_message(user_id, outbound_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="WhatsApp outbound draft not found")
+        raise HTTPException(
+            status_code=409,
+            detail=f"WhatsApp outbound draft cannot be rejected from status: {item['status']}",
+        )
+    item = await get_whatsapp_outbound_message(user_id, outbound_id)
+    return {"status": "rejected", "item": item}
+
+
+@app.post("/whatsapp/outbound/{outbound_id}/send")
+async def whatsapp_outbound_send(outbound_id: int, user_id: str = "owner"):
+    if not WHATSAPP_ACCESS_TOKEN:
+        raise HTTPException(status_code=503, detail="WhatsApp access token is not configured")
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        raise HTTPException(status_code=503, detail="WhatsApp phone number ID is not configured")
+    if not WHATSAPP_GRAPH_API_VERSION:
+        raise HTTPException(status_code=503, detail="WhatsApp Graph API version is not configured")
+
+    item = await claim_approved_whatsapp_outbound_message(user_id, outbound_id)
+    if not item:
+        existing = await get_whatsapp_outbound_message(user_id, outbound_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="WhatsApp outbound draft not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "WhatsApp outbound message is not approved for sending; "
+                f"current status: {existing['status']}"
+            ),
+        )
+
+    try:
+        result = await send_whatsapp_text(
+            to=item["to_phone"],
+            text=item["body"],
+            access_token=WHATSAPP_ACCESS_TOKEN,
+            phone_number_id=WHATSAPP_PHONE_NUMBER_ID,
+            graph_api_version=WHATSAPP_GRAPH_API_VERSION,
+        )
+        await complete_whatsapp_outbound_send(user_id, outbound_id)
+    except Exception as exc:
+        await fail_whatsapp_outbound_send(user_id, outbound_id, str(exc))
+        raise HTTPException(status_code=502, detail=f"WhatsApp send failed: {exc}")
+
+    sent = await get_whatsapp_outbound_message(user_id, outbound_id)
+    return {
+        "status": "sent",
+        "item": sent,
+        "provider_result": result,
+    }
 
 
 @app.get("/whatsapp/webhook")
