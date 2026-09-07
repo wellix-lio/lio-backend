@@ -6481,6 +6481,19 @@ async def whatsapp_outbound_reject(outbound_id: int, user_id: str = "owner"):
 
 @app.post("/whatsapp/outbound/{outbound_id}/send")
 async def whatsapp_outbound_send(outbound_id: int, user_id: str = "owner"):
+    # OUTBOUND_PRECHECK_GUARD_V1
+    existing = await get_whatsapp_outbound_message(user_id, outbound_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="WhatsApp outbound draft not found")
+    if existing["status"] != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "WhatsApp outbound message is not approved for sending; "
+                f"current status: {existing['status']}"
+            ),
+        )
+
     if not WHATSAPP_ACCESS_TOKEN:
         raise HTTPException(status_code=503, detail="WhatsApp access token is not configured")
     if not WHATSAPP_PHONE_NUMBER_ID:
