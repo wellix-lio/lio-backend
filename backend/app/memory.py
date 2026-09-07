@@ -197,12 +197,107 @@ CREATE TABLE IF NOT EXISTS commercial_deal_events (
 CREATE INDEX IF NOT EXISTS idx_commercial_deal_events_deal
 ON commercial_deal_events(user_id, deal_id, created_at);
 
+
+CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+    user_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    sender_phone TEXT,
+    message_type TEXT,
+    status TEXT NOT NULL DEFAULT 'received',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    processed_at DATETIME,
+    PRIMARY KEY(user_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_whatsapp_inbound_status
+ON whatsapp_inbound_messages(user_id, status, updated_at);
+
 """
 
 async def init_db():
     async with aiosqlite.connect(LIO_DB_PATH) as db:
         await db.executescript(CREATE_SQL)
         await db.commit()
+
+
+async def claim_whatsapp_inbound_message(
+    user_id: str,
+    message_id: str,
+    sender_phone: str | None = None,
+    message_type: str | None = None,
+) -> bool:
+    # Atomically claim a new or previously failed inbound WhatsApp message.
+    message_id = (message_id or "").strip()
+    if not message_id:
+        return False
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO whatsapp_inbound_messages(
+                user_id, message_id, sender_phone, message_type, status
+            )
+            VALUES (?, ?, ?, ?, 'received')
+            """,
+            (user_id, message_id, sender_phone, message_type),
+        )
+        cur = await db.execute(
+            """
+            UPDATE whatsapp_inbound_messages
+            SET status='processing',
+                sender_phone=COALESCE(?, sender_phone),
+                message_type=COALESCE(?, message_type),
+                attempts=attempts + 1,
+                last_error=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND message_id=? AND status IN ('received', 'error')
+            """,
+            (sender_phone, message_type, user_id, message_id),
+        )
+        claimed = cur.rowcount == 1
+        await db.commit()
+    return claimed
+
+
+async def complete_whatsapp_inbound_message(user_id: str, message_id: str) -> None:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE whatsapp_inbound_messages
+            SET status='processed',
+                last_error=NULL,
+                processed_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND message_id=?
+            """,
+            (user_id, message_id),
+        )
+        await db.commit()
+
+
+async def fail_whatsapp_inbound_message(
+    user_id: str,
+    message_id: str,
+    error: str,
+) -> None:
+    error_text = " ".join((error or "Unknown error").split())[:1000]
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE whatsapp_inbound_messages
+            SET status='error',
+                last_error=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND message_id=?
+            """,
+            (error_text, user_id, message_id),
+        )
+        await db.commit()
+
 
 async def add_message(user_id: str, role: str, content: str):
     async with aiosqlite.connect(LIO_DB_PATH) as db:
