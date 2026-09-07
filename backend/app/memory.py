@@ -1,4 +1,5 @@
 import aiosqlite
+import re
 from .config import LIO_DB_PATH
 
 CREATE_SQL = """
@@ -767,6 +768,44 @@ async def get_commercial_supplier_languages(user_id: str, supplier_ids: list[int
     for supplier_id, language in rows:
         result.setdefault(int(supplier_id), []).append(language)
     return result
+
+def normalize_commercial_phone(value: str | None) -> str:
+    digits = re.sub(r"\D+", "", value or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    return digits
+
+
+async def find_commercial_suppliers_by_phone(
+    user_id: str,
+    phone_query: str,
+    limit: int = 10,
+):
+    normalized = normalize_commercial_phone(phone_query)
+    if not normalized:
+        return []
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, name, country, city, website, contact_name, email, phone,
+                   supplier_type, status, notes, updated_at
+            FROM commercial_suppliers
+            WHERE user_id=? AND phone IS NOT NULL AND TRIM(phone) <> ''
+            ORDER BY updated_at DESC, id DESC
+            """,
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+
+    matches = [
+        dict(row)
+        for row in rows
+        if normalize_commercial_phone(row["phone"]) == normalized
+    ]
+    return matches[: max(1, int(limit))]
+
 
 async def find_commercial_suppliers(
     user_id: str,
