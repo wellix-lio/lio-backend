@@ -215,6 +215,26 @@ CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
 CREATE INDEX IF NOT EXISTS idx_whatsapp_inbound_status
 ON whatsapp_inbound_messages(user_id, status, updated_at);
 
+
+CREATE TABLE IF NOT EXISTS whatsapp_outbound_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    supplier_id INTEGER,
+    to_phone TEXT NOT NULL,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending_approval',
+    source_message_id TEXT,
+    last_error TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    approved_at DATETIME,
+    sent_at DATETIME,
+    rejected_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_whatsapp_outbound_status
+ON whatsapp_outbound_messages(user_id, status, updated_at);
+
 """
 
 async def init_db():
@@ -295,6 +315,199 @@ async def fail_whatsapp_inbound_message(
             WHERE user_id=? AND message_id=?
             """,
             (error_text, user_id, message_id),
+        )
+        await db.commit()
+
+
+
+async def create_whatsapp_outbound_draft(
+    user_id: str,
+    to_phone: str,
+    body: str,
+    supplier_id: int | None = None,
+    source_message_id: str | None = None,
+) -> int:
+    phone = normalize_commercial_phone(to_phone)
+    text = (body or "").strip()
+    if not phone:
+        raise ValueError("WhatsApp recipient phone is required")
+    if not text:
+        raise ValueError("WhatsApp draft body is required")
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO whatsapp_outbound_messages(
+                user_id, supplier_id, to_phone, body, status, source_message_id
+            )
+            VALUES (?, ?, ?, ?, 'pending_approval', ?)
+            """,
+            (user_id, supplier_id, phone, text, source_message_id),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
+
+
+async def get_whatsapp_outbound_message(
+    user_id: str,
+    outbound_id: int,
+):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, user_id, supplier_id, to_phone, body, status,
+                   source_message_id, last_error, created_at, updated_at,
+                   approved_at, sent_at, rejected_at
+            FROM whatsapp_outbound_messages
+            WHERE user_id=? AND id=?
+            """,
+            (user_id, int(outbound_id)),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_whatsapp_outbound_messages(
+    user_id: str,
+    status: str | None = None,
+    limit: int = 50,
+):
+    params = [user_id]
+    where = "WHERE user_id=?"
+    if status:
+        where += " AND status=?"
+        params.append(status)
+    params.append(max(1, min(int(limit), 200)))
+
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            f"""
+            SELECT id, user_id, supplier_id, to_phone, body, status,
+                   source_message_id, last_error, created_at, updated_at,
+                   approved_at, sent_at, rejected_at
+            FROM whatsapp_outbound_messages
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def approve_whatsapp_outbound_message(
+    user_id: str,
+    outbound_id: int,
+) -> bool:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE whatsapp_outbound_messages
+            SET status='approved',
+                approved_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP,
+                last_error=NULL
+            WHERE user_id=? AND id=? AND status='pending_approval'
+            """,
+            (user_id, int(outbound_id)),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def reject_whatsapp_outbound_message(
+    user_id: str,
+    outbound_id: int,
+) -> bool:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE whatsapp_outbound_messages
+            SET status='rejected',
+                rejected_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND id=? AND status='pending_approval'
+            """,
+            (user_id, int(outbound_id)),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def claim_approved_whatsapp_outbound_message(
+    user_id: str,
+    outbound_id: int,
+) -> dict | None:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            """
+            UPDATE whatsapp_outbound_messages
+            SET status='sending',
+                updated_at=CURRENT_TIMESTAMP,
+                last_error=NULL
+            WHERE user_id=? AND id=? AND status='approved'
+            """,
+            (user_id, int(outbound_id)),
+        )
+        if cur.rowcount != 1:
+            await db.rollback()
+            return None
+
+        cur = await db.execute(
+            """
+            SELECT id, user_id, supplier_id, to_phone, body, status,
+                   source_message_id, last_error, created_at, updated_at,
+                   approved_at, sent_at, rejected_at
+            FROM whatsapp_outbound_messages
+            WHERE user_id=? AND id=?
+            """,
+            (user_id, int(outbound_id)),
+        )
+        row = await cur.fetchone()
+        await db.commit()
+    return dict(row) if row else None
+
+
+async def complete_whatsapp_outbound_send(
+    user_id: str,
+    outbound_id: int,
+) -> None:
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE whatsapp_outbound_messages
+            SET status='sent',
+                sent_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP,
+                last_error=NULL
+            WHERE user_id=? AND id=? AND status='sending'
+            """,
+            (user_id, int(outbound_id)),
+        )
+        await db.commit()
+
+
+async def fail_whatsapp_outbound_send(
+    user_id: str,
+    outbound_id: int,
+    error: str,
+) -> None:
+    error_text = " ".join((error or "Unknown error").split())[:1000]
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE whatsapp_outbound_messages
+            SET status='approved',
+                last_error=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND id=? AND status='sending'
+            """,
+            (error_text, user_id, int(outbound_id)),
         )
         await db.commit()
 
