@@ -1084,6 +1084,26 @@ def normalize_commercial_phone(value: str | None) -> str:
     return digits
 
 
+async def get_commercial_supplier_by_id(
+    user_id: str,
+    supplier_id: int,
+):
+    async with aiosqlite.connect(LIO_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, name, country, city, website, contact_name, email, phone,
+                   supplier_type, status, notes, updated_at
+            FROM commercial_suppliers
+            WHERE user_id=? AND id=?
+            LIMIT 1
+            """,
+            (user_id, int(supplier_id)),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
 async def find_commercial_suppliers_by_phone(
     user_id: str,
     phone_query: str,

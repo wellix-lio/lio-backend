@@ -35,6 +35,7 @@ from .memory import (
     find_exact_commercial_offer,
     add_commercial_supplier_language,
     get_commercial_supplier_languages,
+    get_commercial_supplier_by_id,
     find_commercial_suppliers,
     find_commercial_suppliers_by_phone,
     claim_whatsapp_inbound_message,
