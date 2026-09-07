@@ -6,11 +6,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from .config import OPENAI_API_KEY, LIO_ALLOWED_ORIGINS
+from .config import OPENAI_API_KEY, LIO_ALLOWED_ORIGINS, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET
+from .whatsapp import verify_whatsapp_subscription, verify_whatsapp_signature, extract_whatsapp_messages
 from .memory import (
     init_db,
     add_message,
@@ -6280,6 +6281,65 @@ async def review_shipping_document_file(user_id: str, deal_id: int, file: Upload
     )
     await add_message(user_id, "assistant", authoritative_reply)
     return ChatResponse(reply=authoritative_reply, mode="live")
+
+
+@app.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(request: Request):
+    # Meta verification handshake. No messaging side effects.
+    mode = request.query_params.get("hub.mode", "")
+    token = request.query_params.get("hub.verify_token", "")
+    challenge = request.query_params.get("hub.challenge", "")
+
+    if not WHATSAPP_VERIFY_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="WhatsApp verify token is not configured",
+        )
+
+    if verify_whatsapp_subscription(
+        mode=mode,
+        provided_token=token,
+        expected_token=WHATSAPP_VERIFY_TOKEN,
+    ):
+        return Response(content=challenge, media_type="text/plain")
+
+    raise HTTPException(status_code=403, detail="WhatsApp webhook verification failed")
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook_receive(request: Request):
+    # Receive-only v1: authenticate Meta first, then parse. No automatic reply yet.
+    if not WHATSAPP_APP_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="WhatsApp app secret is not configured",
+        )
+
+    raw_body = await request.body()
+    signature = request.headers.get("x-hub-signature-256", "")
+
+    if not verify_whatsapp_signature(
+        raw_body=raw_body,
+        signature_header=signature,
+        app_secret=WHATSAPP_APP_SECRET,
+    ):
+        raise HTTPException(status_code=401, detail="Invalid WhatsApp webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid WhatsApp webhook JSON")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid WhatsApp webhook payload")
+
+    messages = extract_whatsapp_messages(payload)
+
+    # Acknowledge quickly. Later stages will route authenticated messages to Lio.
+    return {
+        "status": "accepted",
+        "messages_received": len(messages),
+    }
 
 
 @app.post("/voice/transcribe")

@@ -12,3 +12,8 @@ LIO_ENV = os.getenv("LIO_ENV", "development")
 LIO_ALLOWED_ORIGINS = [
     x.strip() for x in os.getenv("LIO_ALLOWED_ORIGINS", "*").split(",") if x.strip()
 ]
+
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
