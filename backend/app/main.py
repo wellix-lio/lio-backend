@@ -6310,6 +6310,103 @@ async def voice_speak(req: SpeechRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Speech error: {exc}")
 
+@app.get("/dashboard/{user_id}")
+async def commercial_dashboard(user_id: str):
+    # Read-only commercial dashboard snapshot for the mobile app.
+    active_deals = await get_commercial_deals(
+        user_id,
+        active_only=True,
+        limit=200,
+    )
+    recent_deals = await get_commercial_deals(
+        user_id,
+        active_only=False,
+        limit=200,
+    )
+    commercial = await get_commercial_memory(
+        user_id,
+        supplier_limit=50,
+        offer_limit=50,
+    )
+
+    queue_items = _commercial_followup_action_queue_items(active_deals)
+    action_queue = []
+    priority_counts = {
+        "OVERDUE": 0,
+        "DUE_TODAY": 0,
+        "UPCOMING": 0,
+        "UNSCHEDULED": 0,
+        "UNKNOWN_DUE": 0,
+    }
+
+    for item in queue_items:
+        bucket = item["bucket"]
+        priority_counts[bucket] = priority_counts.get(bucket, 0) + 1
+        deal = item["deal"]
+        action_queue.append(
+            {
+                "priority": bucket,
+                "timing": item["timing"],
+                "due": item["due"].isoformat() if item["due"] else None,
+                "deal_id": deal.get("id"),
+                "supplier": deal.get("supplier"),
+                "product": deal.get("product"),
+                "offer_id": deal.get("offer_id"),
+                "status": deal.get("status"),
+                "waiting_on": deal.get("waiting_on"),
+                "next_action": deal.get("next_action"),
+                "next_action_due": deal.get("next_action_due"),
+                "updated_at": deal.get("updated_at"),
+            }
+        )
+
+    status_counts = {
+        status: 0
+        for status in (
+            "negotiating",
+            "waiting_supplier",
+            "awaiting_sample",
+            "awaiting_pi",
+            "production",
+            "inspection",
+            "ready_to_ship",
+            "completed",
+            "cancelled",
+        )
+    }
+    for deal in recent_deals:
+        status = deal.get("status")
+        if status:
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+    suppliers = commercial.get("suppliers", [])
+    offers = commercial.get("offers", [])
+
+    return {
+        "user_id": user_id,
+        "summary": {
+            "active_deals": len(active_deals),
+            "deals_loaded": len(recent_deals),
+            "recent_suppliers": len(suppliers),
+            "recent_offers": len(offers),
+            "overdue": priority_counts.get("OVERDUE", 0),
+            "due_today": priority_counts.get("DUE_TODAY", 0),
+            "upcoming": priority_counts.get("UPCOMING", 0),
+            "unscheduled": priority_counts.get("UNSCHEDULED", 0),
+            "awaiting_pi": status_counts.get("awaiting_pi", 0),
+            "production": status_counts.get("production", 0),
+            "inspection": status_counts.get("inspection", 0),
+            "ready_to_ship": status_counts.get("ready_to_ship", 0),
+        },
+        "status_counts": status_counts,
+        "priority_counts": priority_counts,
+        "action_queue": action_queue,
+        "active_deals": active_deals,
+        "recent_suppliers": suppliers,
+        "recent_offers": offers,
+    }
+
+
 class WatchRequest(BaseModel):
     user_id: str = "owner"
     name: str = Field(min_length=1, max_length=200)
