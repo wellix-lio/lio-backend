@@ -5799,7 +5799,13 @@ def _is_offer_decision_action_request(message: str) -> bool:
         "عرض", "مورد", "صفقة", "سعر",
     )
 
-    return any(x in folded for x in action_signals) and any(
+    flexible_action_signal = bool(re.search(
+        r"\b(?:prepare|draft|write)\b.{0,60}\b(?:reply|message)\b",
+        folded,
+        flags=re.IGNORECASE,
+    ))
+
+    return (any(x in folded for x in action_signals) or flexible_action_signal) and any(
         x in folded for x in commercial_signals
     )
 
