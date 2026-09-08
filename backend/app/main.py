@@ -6224,8 +6224,49 @@ async def health():
         "languages": ["ar", "de", "en"],
     }
 
+def _is_active_deal_list_request(message: str) -> bool:
+    folded = (message or "").casefold()
+    if any(x in folded for x in ("do not show", "don\'t show", "nicht anzeigen", "\u0644\u0627 \u062a\u0639\u0631\u0636", "\u0644\u0627 \u062a\u0638\u0647\u0631")):
+        return False
+    arabic = (
+        "\u0635\u0641\u0642\u0627\u062a" in folded
+        and "\u0646\u0634\u0637" in folded
+        and any(x in folded for x in ("\u0627\u0639\u0631\u0636", "\u0623\u0639\u0631\u0636", "\u0627\u0638\u0647\u0631", "\u0623\u0638\u0647\u0631", "\u0642\u0627\u0626\u0645\u0629", "\u0645\u0627 \u0647\u064a", "\u0645\u0627\u0647\u064a"))
+    )
+    english = (
+        "active" in folded and "deal" in folded
+        and any(x in folded for x in ("show", "list", "display", "what are", "which"))
+    )
+    german = (
+        "aktiv" in folded and "deal" in folded
+        and any(x in folded for x in ("zeig", "liste", "welche", "anzeigen"))
+    )
+    return arabic or english or german
+
+
+async def _active_deal_list_reply(user_id: str, message: str) -> str:
+    deals = await get_commercial_deals(user_id, active_only=True, limit=200)
+    if any("\u0600" <= ch <= "\u06ff" for ch in (message or "")):
+        if not deals:
+            return "\u0644\u0627 \u062a\u0648\u062c\u062f \u0635\u0641\u0642\u0627\u062a \u0646\u0634\u0637\u0629 \u0645\u0633\u062c\u0644\u0629."
+        lines = ["\u0627\u0644\u0635\u0641\u0642\u0627\u062a \u0627\u0644\u0646\u0634\u0637\u0629 \u0627\u0644\u0645\u0633\u062c\u0644\u0629:"]
+        lines.extend(f"- \u0627\u0644\u0635\u0641\u0642\u0629 \u0631\u0642\u0645 {deal.get('id')} \u2014 {deal.get('supplier') or '\u063a\u064a\u0631 \u0645\u0633\u062c\u0644'}" for deal in deals)
+        return "\n".join(lines)
+    if not deals:
+        return "No active deals are registered."
+    lines = ["Active registered deals:"]
+    lines.extend(f"- Deal #{deal.get('id')} - {deal.get('supplier') or 'Not recorded'}" for deal in deals)
+    return "\n".join(lines)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    if _is_active_deal_list_request(req.message):
+        await add_message(req.user_id, "user", req.message)
+        reply = await _active_deal_list_reply(req.user_id, req.message)
+        await add_message(req.user_id, "assistant", reply)
+        return ChatResponse(reply=reply, mode="live")
+
     memory_action = await _capture_user_memory(req.user_id, req.message)
     await add_message(req.user_id, "user", req.message)
 
