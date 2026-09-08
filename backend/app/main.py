@@ -358,7 +358,11 @@ def _commercial_save_intent(message: str) -> bool:
         "supplier", "factory", "vendor", "quote", "price", "offer",
         "lieferant", "fabrik", "angebot", "preis",
     )
-    return any(word in positive_scan for word in save_words) and any(
+    has_explicit_save_word = any(
+        re.search(rf"(?<!\w){re.escape(word)}(?!\w)", positive_scan, flags=re.IGNORECASE)
+        for word in save_words
+    )
+    return has_explicit_save_word and any(
         word in folded for word in commercial_words
     )
 
