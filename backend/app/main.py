@@ -87,6 +87,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     mode: str
+    whatsapp_draft_id: int | None = None
+    whatsapp_draft_status: str | None = None
 
 def _clean_value(value: str) -> str:
     return value.strip().strip('"\'“”‘’ ').rstrip(".،,!?؟")[:240]
@@ -5802,6 +5804,92 @@ def _is_offer_decision_action_request(message: str) -> bool:
     )
 
 
+
+_WHATSAPP_CHAT_DRAFT_START = "<<<LIO_SUPPLIER_DRAFT_START>>>"
+_WHATSAPP_CHAT_DRAFT_END = "<<<LIO_SUPPLIER_DRAFT_END>>>"
+_WHATSAPP_CHAT_DRAFT_ACTIONS = {
+    "PREPARE_CLARIFICATION",
+    "PREPARE_NEGOTIATION",
+    "PREPARE_FOLLOW_UP",
+}
+
+
+def _extract_whatsapp_chat_draft(reply: str) -> str | None:
+    text = reply or ""
+    start = text.find(_WHATSAPP_CHAT_DRAFT_START)
+    if start < 0:
+        return None
+    start += len(_WHATSAPP_CHAT_DRAFT_START)
+    end = text.find(_WHATSAPP_CHAT_DRAFT_END, start)
+    if end < 0:
+        return None
+
+    body = text[start:end].strip()
+    if not body or len(body) > 4000:
+        return None
+    if _WHATSAPP_CHAT_DRAFT_START in body or _WHATSAPP_CHAT_DRAFT_END in body:
+        return None
+    return body
+
+
+def _clean_whatsapp_chat_draft_markers(reply: str) -> str:
+    return (
+        (reply or "")
+        .replace(_WHATSAPP_CHAT_DRAFT_START, "")
+        .replace(_WHATSAPP_CHAT_DRAFT_END, "")
+        .strip()
+    )
+
+
+async def _whatsapp_chat_draft_target_from_handoff(
+    user_id: str,
+    handoff_context: str,
+):
+    if not handoff_context.startswith("SMART DECISION ACTION HANDOFF."):
+        return None
+
+    deal_match = re.search(
+        r"^Deal ID:\s*(\d+)\s*$",
+        handoff_context,
+        flags=re.MULTILINE,
+    )
+    action_match = re.search(
+        r"^Safe handoff action:\s*([A-Z_]+)\s*$",
+        handoff_context,
+        flags=re.MULTILINE,
+    )
+    if not deal_match or not action_match:
+        return None
+
+    action = action_match.group(1)
+    if action not in _WHATSAPP_CHAT_DRAFT_ACTIONS:
+        return None
+
+    deal_id = int(deal_match.group(1))
+    deal = await get_commercial_deal_by_id(user_id, deal_id)
+    if not deal:
+        return None
+
+    supplier_id = deal.get("supplier_id")
+    if supplier_id is None:
+        return None
+
+    supplier = await get_commercial_supplier_by_id(user_id, int(supplier_id))
+    if not supplier:
+        return None
+
+    phone = (supplier.get("phone") or "").strip()
+    if not phone:
+        return None
+
+    return {
+        "deal_id": deal_id,
+        "supplier_id": int(supplier_id),
+        "to_phone": phone,
+        "action": action,
+    }
+
+
 async def _commercial_offer_decision_action_handoff_context(user_id: str, message: str) -> str:
     # Build read-only action-preparation context from the latest saved offer guidance.
     if not _is_offer_decision_action_request(message):
@@ -5818,10 +5906,15 @@ async def _commercial_offer_decision_action_handoff_context(user_id: str, messag
     if deal_id_match:
         deal_id = int(deal_id_match.group(1))
         deal = await get_commercial_deal_by_id(user_id, deal_id)
-        if deal:
-            supplier_id = deal.get("supplier_id")
+        if not deal:
+            return (
+                "SMART DECISION ACTION HANDOFF.\n"
+                f"The explicitly requested deal #{deal_id} was not found. Ask the user to verify the deal ID.\n"
+                "Do not prepare or create an outbound supplier draft for a different deal."
+            )
+        supplier_id = deal.get("supplier_id")
 
-    if supplier_id is None:
+    if supplier_id is None and not deal_id_match:
         deals = await get_commercial_deals(user_id, active_only=True, limit=20)
         if len(deals) == 1:
             deal_id = deals[0].get("id")
@@ -5886,6 +5979,15 @@ async def _commercial_offer_decision_action_handoff_context(user_id: str, messag
             "Output preference: summarize why acceptance is being considered and provide a review-only draft. "
             "State clearly that explicit user approval is still required and nothing has been accepted or sent."
         )
+
+    if handoff["action"] in _WHATSAPP_CHAT_DRAFT_ACTIONS:
+        lines.extend([
+            "WhatsApp draft formatting rule: wrap only the exact supplier-facing message body between these markers:",
+            _WHATSAPP_CHAT_DRAFT_START,
+            _WHATSAPP_CHAT_DRAFT_END,
+            "Put no analysis, labels, status text, or internal notes inside the markers. "
+            "The markers are for internal draft extraction only and do not mean the message was sent.",
+        ])
 
     return "\n".join(lines)
 
@@ -6167,8 +6269,35 @@ async def chat(req: ChatRequest):
     try:
         from .agents import run_lio
         reply = await run_lio(req.message, context_text)
+
+        whatsapp_draft_id = None
+        whatsapp_draft_status = None
+        draft_body = _extract_whatsapp_chat_draft(reply)
+        if draft_body:
+            draft_target = await _whatsapp_chat_draft_target_from_handoff(
+                req.user_id,
+                decision_action_handoff_context,
+            )
+            if draft_target:
+                whatsapp_draft_id = await create_whatsapp_outbound_draft(
+                    user_id=req.user_id,
+                    to_phone=draft_target["to_phone"],
+                    body=draft_body,
+                    supplier_id=draft_target["supplier_id"],
+                    source_message_id=(
+                        f"chat:deal:{draft_target['deal_id']}:{draft_target['action']}"
+                    ),
+                )
+                whatsapp_draft_status = "pending_approval"
+
+        reply = _clean_whatsapp_chat_draft_markers(reply)
         await add_message(req.user_id, "assistant", reply)
-        return ChatResponse(reply=reply, mode="live")
+        return ChatResponse(
+            reply=reply,
+            mode="live",
+            whatsapp_draft_id=whatsapp_draft_id,
+            whatsapp_draft_status=whatsapp_draft_status,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lio agent error: {exc}")
 
